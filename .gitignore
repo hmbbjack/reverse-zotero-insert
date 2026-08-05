@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+config.local.env
+.env
+resolution_summary.json
+dedup_report.json
+item_mapping.json
+论文_zotero.docx
+*.docx
+!tests/
+.DS_Store
