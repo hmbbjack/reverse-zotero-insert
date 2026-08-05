@@ -2,25 +2,21 @@
 """
 Config for the "逆向 Zotero 插入" skill.
 
-Design goal: the committed code contains NO hardcoded personal identifiers
+Design goal: the code contains NO hardcoded personal identifiers
 (userID, emails, URIs). All personal values come from the environment.
 
 Sources, in priority order:
-  1. Environment variables (set globally, or via config.local.env in this dir).
+  1. Environment variables (set globally, or via config.local.env / .env in this dir).
   2. Auto-derivation from ~/Zotero/zotero.sqlite (users table) - works when the
      DB is present and readable.
   3. Placeholder "<YOUR_USER_ID>" with a warning.
-
-Packaging (make_packages.py) produces two zips from the SAME code:
-  - 个人版 (personal): ships a config.local.env with the real values baked in.
-  - 开源版 (open-source): ships config.example.env with CHANGE_ME placeholders.
 """
 import os
 import shutil
 import sqlite3
 import tempfile
 
-# 个人版本地配置文件（打包时注入，随个人版 zip 分发；不提交到 GitHub）
+# 可选本地配置文件名（KEY=VALUE）；不提交到公开仓库
 _LOCAL_ENV_NAMES = ("config.local.env", ".env")
 
 

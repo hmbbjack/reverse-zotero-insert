@@ -32,7 +32,8 @@ Zotero 在 Word 文档（`word/document.xml`）中用三类域代码，存放在
 `<w:r><w:fldChar w:fldCharType="begin"/></w:r>` → `<w:r><w:instrText xml:space="preserve"> ADDIN … </w:instrText></w:r>` → `<w:r><w:fldChar w:fldCharType="separate"/></w:r>` → `<w:r><w:t xml:space="preserve">显示文本</w:t></w:r>` → `<w:r><w:fldChar w:fldCharType="end"/></w:r>`
 
 1. **引文域**：`ADDIN ZOTERO_ITEM CSL_CITATION {json}`
-   - json = `{"citationID":"…","properties":{"formattedCitation":"显示文本","plainCitation":"显示文本","dontUpdate":true,"noteIndex":0},"citationItems":[{"id":N,"uris":["http://zotero.org/users/<userID>/items/<itemKey>"],"itemData":<CSL-JSON>}],"schema":"https://github.com/citation-style-language/schema/raw/master/csl-citation.json"}`
+   - json = `{"citationID":"…","properties":{"formattedCitation":"显示文本","plainCitation":"显示文本","dontUpdate":false,"noteIndex":0},"citationItems":[{"id":N,"uris":["http://zotero.org/users/<userID>/items/<itemKey>"],"itemData":<CSL-JSON>}],"schema":"https://github.com/citation-style-language/schema/raw/master/csl-citation.json"}`
+   - 默认 `dontUpdate:false`（引文随 Zotero 样式自动重排）；仅当要**冻结**某条引文外观不改时才设 `true`。
 2. **参考文献表域**：`ADDIN ZOTERO_BIBL {json} CSL_BIBLIOGRAPHY`（**注意尾部 `CSL_BIBLIOGRAPHY`**，不能漏）
    - json = `{"uncited":[["uri"],…],"omitted":[],"custom":[]}`。参考文献表内容由引文域 + uncited 重新生成；域的显示文本只是缓存。
 3. **文档首选项域**：`ADDIN ZOTERO_DOCUMENT_PREFERENCES {json}`，用书签 `ZOTERO_PREF` 包裹；参考文献表域用书签 `ZOTERO_BREF` 包裹。
@@ -45,15 +46,15 @@ Zotero 在 Word 文档（`word/document.xml`）中用三类域代码，存放在
 - **userID（URI 前缀）**：Zotero 个人库条目的 URI = `http://zotero.org/users/<userID>/items/<itemKey>`。`<userID>` 由 `config.py` 从环境变量 `ZOTERO_USER_ID` 或 Zotero 数据库 `users` 表读取（DB 在 `~/Zotero/zotero.sqlite`，Zotero 运行时被锁——复制一份快照再读）。已同步库用真实数字 userID；未同步库用 `users/local/<localKey>`。
 - **itemKey**：通过 Zotero MCP（`http://127.0.0.1:23120/mcp`，JSON-RPC）的 `write_item`(action=create) 或 `search_library`+`get_item_details`(mode=complete 才返回 DOI) 获取。
 - **CSL-JSON itemData**：用 CrossRef 搜索 API（`https://api.crossref.org/works?query.bibliographic=...`）按书目信息解析得到完整元数据（含完整作者列表，非"et al."）；无 DOI 的用 PubMed 兜底。
-- **配置**：所有个人标识（userID、URI 前缀、CrossRef mailto、NCBI key、MCP URL）由 `config.py` 统一读取，`config.local.env`（个人版）按 `KEY=VALUE` 提供，代码零硬编码。开源版含 `config.example.env` 占位示例。
+- **配置**：所有个人标识（userID、URI 前缀、CrossRef mailto、NCBI key、MCP URL）由 `config.py` 统一读取，按 `KEY=VALUE` 写入环境变量或 `config.local.env`（放代码同目录即可被自动加载），代码零硬编码。未配置时自动从 `~/Zotero/zotero.sqlite` 推导 userID。
 
 ## 工作流程
 
 1. **解析文档**：用 python-docx 读出每个段落的文字、定位正文引文位置和参考文献表段落范围。
 2. **建立引文匹配器**：对每篇文档，按其参考文献集构建 `{年份: [(第一作者姓, itemKey)]}`。匹配时**大小写不敏感**（CrossRef 偶尔返回全大写姓，如 PHOENIX），且匹配"姓 + 边界"（后面跟 et al / and / 逗号-位于段首）。
-3. **生成域代码**：把每处引文的文字替换为引文域（显示文本=原文，`dontUpdate:true` 保留原文外观，同时通过 uris 链接到库条目，itemData 内嵌作兜底）。参考文献表段落用参考文献表域包裹。文首插入首选项域（隐藏段落，书签 ZOTERO_PREF）。
+3. **生成域代码**：把每处引文的文字替换为引文域（显示文本=原文，默认 `dontUpdate:false` 让引文随样式自动重排；如需冻结单条外观可设 `true`，并通过 uris 链接到库条目，itemData 内嵌作兜底）。参考文献表段落用参考文献表域包裹。文首插入首选项域（隐藏段落，书签 ZOTERO_PREF）。
 4. **写回 docx**：只替换 `word/document.xml`，其余 zip 部分原样保留。
-5. **校验**：fldChar begin/separate/end 配对平衡；所有 JSON 合法；所有 URI 指向真实库条目；itemData 含 type/title/author/issued；显示文本与原文逐字一致；引文**零遗漏**（用宽网扫描所有"作者+年份"模式逐一核对）。
+5. **校验**：`verify()` 检查 fldChar begin/separate/end 配对平衡；所有 JSON 合法；所有 URI 指向真实库条目；itemData 含 type/title/author/issued。若传入 `src_docx` 与 `item_mapping`,还会比对原文做**引文零遗漏 + 显示文本逐字一致**校验（用引文匹配器在原文里找出所有"作者+年份",逐一核对是否都出现在输出域的显示文本中）。
 
 ## ⚠️ 避坑要点（实测踩过的坑）
 

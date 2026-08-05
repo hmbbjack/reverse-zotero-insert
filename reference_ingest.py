@@ -71,16 +71,30 @@ def resolve_style_id(name_or_journal):
 def _norm(s):
     if not s:
         return ""
-    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode().lower()
-    return re.sub(r'[^a-z0-9]', '', s)
+    # 保留 CJK（中文文献），NFKD 折叠拉丁重音，去标点/空白
+    s = unicodedata.normalize('NFKD', s).lower()
+    return re.sub(r'[^a-z0-9一-鿿]', '', s)
+
+
+def _is_cjk(s):
+    return any('一' <= ch <= '鿿' for ch in s)
 
 
 def _title_words(s):
-    """把标题拆成规范化单词集合（用于词级重叠，区别于 _norm 的整串拼接）。"""
+    """把标题拆成规范化单词集合，用于词级重叠。
+
+    拉丁词按词；中文按整段 + 二元组（bigram），使"儿童自闭症"与"儿童自闭症干预研究"
+    能在词级有重叠，让置信度对中文标题也有效。
+    """
     if not s:
         return set()
-    t = unicodedata.normalize('NFKD', str(s)).encode('ascii', 'ignore').decode().lower()
-    return set(re.findall(r'[a-z]+', t))
+    t = unicodedata.normalize('NFKD', str(s)).lower()
+    words = set(re.findall(r'[a-z]+', t))
+    for run in re.findall(r'[一-鿿]+', t):
+        words.add(run)
+        for i in range(len(run) - 1):
+            words.add(run[i:i + 2])
+    return words
 
 
 def _first_author_lastname(csl):
@@ -231,15 +245,17 @@ def parse_numbered_reference(text):
         first = clauses[0]
         # 判定首段是否为作者部分：含逗号/分号（多作者），或含 and/&（"Smith J and Johnson K"），
         # 或短从句（≤3 词）以单/多字母首字母结尾（"Smith JD" / "Smith J"）。
+        # 或为 2-4 字中文人名（"张三"）。
         # 避免把 "A study of treatment outcomes" / "Risk factors for Y" 这类标题误判为作者。
         n_sep = first.count(',') + first.count(';')
         has_and = bool(re.search(r'\s+(?:and|&)\s+', first))
         n_tok = len(first.split())
         has_initials = (n_sep > 0 or has_and
                         or (n_tok <= 3 and re.search(r'\s+[A-Z][A-Z.]{0,2}[.,]?$', first)))
+        has_cjk_author = bool(re.fullmatch(r'[一-鿿]{2,4}', first))
         has_year = bool(re.search(r'\b(19|20)\d{2}\b', first))
-        if has_initials and not has_year:
-            # 首段是作者部分："Smith J, Johnson K" / "Smith JD" / "Smith J and Johnson K"
+        if (has_initials or has_cjk_author) and not has_year:
+            # 首段是作者部分："Smith J, Johnson K" / "Smith JD" / "张三"
             for part in re.split(r'\s*[;,]\s*|\s+and\s+', first):
                 part = part.strip()
                 if not part:
@@ -251,6 +267,9 @@ def parse_numbered_reference(text):
                     family = m.group(1).strip()
                     given = m.group(2).strip().rstrip('.,')
                     authors.append({"family": family, "given": given})
+                elif _is_cjk(part):
+                    # 中文人名整体作为姓（查询用；真正匹配由 CSL 的 family 驱动）
+                    authors.append({"family": part, "given": ""})
                 else:
                     authors.append({"family": part, "given": ""})
             if len(clauses) >= 2:

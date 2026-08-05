@@ -38,8 +38,13 @@ XMLSPACE = '{http://www.w3.org/XML/1998/namespace}space'
 # ---------- 基础工具 ----------
 def _norm(s):
     if not s: return ""
-    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode().lower()
-    return re.sub(r'[^a-z0-9]', '', s)
+    # 保留 CJK（中文文献），NFKD 折叠拉丁重音，去标点/空白
+    s = unicodedata.normalize('NFKD', s).lower()
+    return re.sub(r'[^a-z0-9一-鿿]', '', s)
+
+def _is_cjk(s):
+    """是否含 CJK 统一表意文字（中文/日文汉字）。"""
+    return any('一' <= ch <= '鿿' for ch in s)
 
 def _first_author_lastname(csl):
     au = csl.get('author', [])
@@ -63,6 +68,27 @@ def build_matcher(item_mapping):
         if ln and y: by_year.setdefault(y, []).append((ln, k))
     return by_year, nih
 
+def _match_cjk_surname(part, var, offset):
+    """在 part 里匹配中文姓。中文姓后通常直接跟名（继续 CJK）或标准边界；
+    姓前须是名字起始（段首/空格/逗号等分隔符或 '和/及/与/或/等' 连接词）。返回位置或 -1。
+    """
+    for m in re.finditer(re.escape(var), part):
+        i = m.start()
+        if i != offset:
+            prev = part[i - 1]
+            if prev and not (prev.isspace() or prev in ',(;(&和及与或等、'):
+                continue
+        e = m.end()
+        after = part[e] if e < len(part) else ''
+        if after:
+            if _is_cjk(after):
+                return i          # 姓后接名（"张" + "三"）
+            if not re.match(r'\s*(?:et al\.?|and\b|&\b|,|\)|$)', after):
+                continue
+        return i
+    return -1
+
+
 def match_part(part, year, by_year, nih_key):
     """在 part 文本里找年份=year、第一作者姓出现的条目。大小写不敏感，要求姓后跟边界。"""
     if ('NIH' in part or 'NOT-OD' in part) and nih_key: return nih_key
@@ -71,33 +97,43 @@ def match_part(part, year, by_year, nih_key):
         variants = [ln]
         if ' ' in ln: variants.append(ln.split()[-1])  # 多词姓也试末词(De Vries->Vries)
         for var in variants:
-            found = False
-            for m in re.finditer(re.escape(var), part, re.IGNORECASE):
-                is_start = (m.start() == offset)
-                bm = re.match(r'\s*(et al\.?|and\b|&\b|,|\)|$)', part[m.end():])
-                ok = bool(bm) and not (bm.group(1) == ',' and not is_start)
-                if ok:
-                    cands.append((m.start(), k)); found = True; break
-            if found: break
+            if not var: continue
+            if _is_cjk(var):
+                pos = _match_cjk_surname(part, var, offset)
+                if pos >= 0:
+                    cands.append((pos, k)); break
+            else:
+                found = False
+                for m in re.finditer(re.escape(var), part, re.IGNORECASE):
+                    is_start = (m.start() == offset)
+                    bm = re.match(r'\s*(et al\.?|and\b|&\b|,|\)|$)', part[m.end():])
+                    ok = bool(bm) and not (bm.group(1) == ',' and not is_start)
+                    if ok:
+                        cands.append((m.start(), k)); found = True; break
+                if found: break
     if not cands: return None
     cands.sort()
     return cands[0][1]
 
 NARR = re.compile(r'([A-Z][\wÀ-ÿ\'\-]+(?:\s+(?:and|&)\s+[\wÀ-ÿ\'\-]+(?:\s+[\wÀ-ÿ\'\-]+){0,2})?(?:\s+et al\.)?)\s*\((\d{4})\)')
-PAREN = re.compile(r'\(([^()]*?\d{4}[^()]*?)\)')
+NARR_CJK = re.compile(r'([一-鿿]{2,10}(?:、[一-鿿]{2,10})*(?:\s*等)?)\s*[（(](\d{4})[）)]')
+PAREN = re.compile(r'[（(]([^（）()]*?\d{4}[^（）()]*?)[）)]')
 
 def find_citations(text, by_year, nih_key):
-    """返回 [(start, end, display_text, [ref_key])]。括号式 + 叙述式，零遗漏。"""
+    """返回 [(start, end, display_text, [ref_key])]。括号式 + 叙述式（拉丁 + 中文，兼容全角标点）。"""
     spans = []
     for m in NARR.finditer(text):
+        k = match_part(m.group(1), m.group(2), by_year, nih_key)
+        if k: spans.append((m.start(), m.end(), m.group(0), [k]))
+    for m in NARR_CJK.finditer(text):
         k = match_part(m.group(1), m.group(2), by_year, nih_key)
         if k: spans.append((m.start(), m.end(), m.group(0), [k]))
     for m in PAREN.finditer(text):
         g = m.group(1)
         if not re.search(r'\d{4}', g): continue
         if re.match(r'^\d{4}', g.strip()): continue                  # 跳过"(2016 to 2026)"等
-        if not re.search(r'[A-Z][a-z]{2,}|NIH|NOT-OD', g): continue  # 必须有作者词(否则非引文)
-        parts = [p.strip() for p in g.split(';')]; items = []; ok = True
+        if not re.search(r'[A-Z][a-z]{2,}|NIH|NOT-OD|[一-鿿]{2,}', g): continue  # 必须有作者词(否则非引文)
+        parts = [p.strip() for p in re.split(r'[;；]', g)]; items = []; ok = True
         for part in parts:
             ym = re.search(r'(\d{4})', part)
             if not ym: continue                 # 跳过无年份的分片(如"ALSPAC;")
@@ -488,9 +524,72 @@ def insert_table_citations(src_docx, out_docx, item_mapping, doi_column, refnum_
 
 
 # ---------- 校验 ----------
-def verify(out_docx, valid_item_keys):
-    """返回 (ok, 详情)。检查 fldChar 平衡、JSON 合法、URI 有效、CSL 完整。
-    注意：一个域的指令可能被 Word 拆成多个 <w:instrText>，必须把同一域(begin..end)内所有 instrText 拼接后再解析。"""
+def _extract_citation_fields(root):
+    """提取输出文档里所有引文域的 (显示文本, formattedCitation)。"""
+    fields = []
+    in_f = in_disp = False
+    cur = []
+    disp = []
+    for r in root.iter(W + 'r'):
+        for ch in r:
+            tg = etree.QName(ch).localname
+            if tg == 'fldChar':
+                ft = ch.get(W + 'fldCharType')
+                if ft == 'begin':
+                    in_f = True; in_disp = False; cur = []; disp = []
+                elif ft == 'separate':
+                    in_disp = True
+                elif ft == 'end' and in_f:
+                    t = ''.join(cur)
+                    if 'CSL_CITATION' in t:
+                        try:
+                            obj = json.loads(t.split('CSL_CITATION', 1)[1].strip())
+                            fmt = obj.get('properties', {}).get('formattedCitation', '')
+                        except Exception:
+                            fmt = ''
+                        fields.append((''.join(disp), fmt))
+                    in_f = in_disp = False
+            elif tg == 'instrText' and in_f and not in_disp:
+                cur.append(ch.text or '')
+            elif tg == 't' and in_f and in_disp:
+                disp.append(ch.text or '')
+    return fields
+
+
+def _verify_zero_miss(src_docx, out_docx, item_mapping):
+    """比对原文与输出：确保每个"作者+年份"引文都被转换（零遗漏），且显示文本逐字一致。"""
+    by_year, nih = build_matcher(item_mapping)
+    zsrc = zipfile.ZipFile(src_docx)
+    rsrc = etree.fromstring(zsrc.read('word/document.xml'))
+    expected = []
+    for p in rsrc.find(W + 'body').findall(W + 'p'):
+        text = ''.join((t.text or '') for t in p.iter(W + 't'))
+        for (_s, _e, disp, _it) in find_citations(text, by_year, nih):
+            expected.append(disp)
+    zout = zipfile.ZipFile(out_docx)
+    rout = etree.fromstring(zout.read('word/document.xml'))
+    fields = _extract_citation_fields(rout)
+    actual = []
+    for (disp, fmt) in fields:
+        if disp:
+            actual.append(disp)
+        if fmt:
+            actual.append(fmt)
+    an = set(_norm(d) for d in actual if d)
+    # 零遗漏 + 显示文本与原文一致：每个期望引文都应出现在某域（显示文本或 formattedCitation）
+    missed = [e for e in expected if _norm(e) not in an]
+    # 域内一致性：domains 的显示文本应等于其 formattedCitation
+    mism = [{"display": d, "formatted": f} for (d, f) in fields if f and _norm(d) != _norm(f)]
+    return missed, mism
+
+
+def verify(out_docx, valid_item_keys, src_docx=None, item_mapping=None):
+    """返回 (ok, 详情)。结构校验：fldChar 平衡、JSON 合法、URI 有效、CSL 完整。
+
+    若同时给 src_docx 与 item_mapping，则额外做"引文零遗漏 + 显示文本逐字一致"比对：
+    用原文的引文匹配器找出所有应转换的引文，逐一核对是否都出现在输出域的显示文本里。
+    注意：一个域的指令可能被 Word 拆成多个 <w:instrText>，须把同一域内所有 instrText 拼接后再解析。
+    """
     z = zipfile.ZipFile(out_docx); root = etree.fromstring(z.read('word/document.xml'))
     # 按 begin..end 切分域，拼接每个域内的所有 instrText
     fields = []; in_f = False; cur = []
@@ -522,7 +621,14 @@ def verify(out_docx, valid_item_keys):
     bg = len([1 for f in root.iter(W + 'fldChar') if f.get(W + 'fldCharType') == 'begin'])
     ed = len([1 for f in root.iter(W + 'fldChar') if f.get(W + 'fldCharType') == 'end'])
     ok = bg == ed and bad_json == 0 and bad_uri == 0 and incomplete == 0
-    return ok, dict(cites=cites, bibs=bibs, prefs=prefs, fldChar=f"{bg}/{ed}", bad_json=bad_json, bad_uri=bad_uri, incomplete=incomplete)
+    detail = dict(cites=cites, bibs=bibs, prefs=prefs, fldChar=f"{bg}/{ed}",
+                  bad_json=bad_json, bad_uri=bad_uri, incomplete=incomplete)
+    if src_docx and item_mapping:
+        missed, mism = _verify_zero_miss(src_docx, out_docx, item_mapping)
+        detail["missed_citations"] = missed
+        detail["display_mismatches"] = mism
+        ok = ok and not missed and not mism
+    return ok, detail
 
 
 if __name__ == '__main__':

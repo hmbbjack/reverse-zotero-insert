@@ -544,5 +544,113 @@ class TestFullPipeline(unittest.TestCase):
             self.assertEqual(detail["bibs"], 1)
 
 
+class TestVerifyZeroMiss(unittest.TestCase):
+    """verify 传入 src + item_mapping 时的"引文零遗漏 + 显示文本逐字一致"校验。"""
+
+    def _mapping(self):
+        return {
+            "smith2007": {"itemKey": "AA", "uri": "http://zotero.org/users/U/items/AA",
+                          "csl": {"type": "article-journal", "title": "Human emotion",
+                                  "author": [{"family": "Smith", "given": "J"}],
+                                  "issued": {"date-parts": [[2007]]}},
+                          "doi": "", "first_author": "Smith", "year": "2007"},
+            "jones2010": {"itemKey": "BB", "uri": "http://zotero.org/users/U/items/BB",
+                          "csl": {"type": "article-journal", "title": "A title",
+                                  "author": [{"family": "Jones", "given": "K"}],
+                                  "issued": {"date-parts": [[2010]]}},
+                          "doi": "", "first_author": "Jones", "year": "2010"},
+        }
+
+    def test_catches_missed_citation(self):
+        from docx import Document
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "s.docx"); out = os.path.join(td, "o.docx")
+            d = Document()
+            d.add_paragraph("Claims (Smith, 2007) here.")
+            d.add_paragraph("And (Jones, 2010) here.")   # 不在 body_para_range，应被漏抓
+            d.add_paragraph("[1] Smith J. Human emotion. Cognition. 2007.")
+            d.add_paragraph("[2] Jones K. A title. AJournal. 2010.")
+            d.save(src)
+            m = self._mapping()
+            zfi.insert_zotero_fields(src, out, (0, 1), [2, 3], m,
+                                     uri_prefix="http://zotero.org/users/U/items/")
+            # 仅结构校验：通过（1 条引文被转换）
+            ok_struct, det = zfi.verify(out, ["AA", "BB"])
+            self.assertTrue(ok_struct)
+            self.assertEqual(det["cites"], 1)
+            # 全量校验：应标记漏抓 Jones
+            ok_full, det2 = zfi.verify(out, ["AA", "BB"], src_docx=src, item_mapping=m)
+            self.assertFalse(ok_full)
+            self.assertIn("(Jones, 2010)", det2["missed_citations"])
+            self.assertNotIn("(Smith, 2007)", det2["missed_citations"])
+
+    def test_no_miss_when_all_converted(self):
+        from docx import Document
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "s.docx"); out = os.path.join(td, "o.docx")
+            d = Document()
+            d.add_paragraph("Claims (Smith, 2007) and (Jones, 2010) here.")
+            d.add_paragraph("[1] Smith J. Human emotion. Cognition. 2007.")
+            d.add_paragraph("[2] Jones K. A title. AJournal. 2010.")
+            d.save(src)
+            m = self._mapping()
+            zfi.insert_zotero_fields(src, out, (0, 1), [1, 2], m,
+                                     uri_prefix="http://zotero.org/users/U/items/")
+            ok_full, det2 = zfi.verify(out, ["AA", "BB"], src_docx=src, item_mapping=m)
+            self.assertTrue(ok_full, det2)
+            self.assertEqual(det2["missed_citations"], [])
+
+
+class TestChineseSupport(unittest.TestCase):
+    """中文文献：解析、引文匹配（含全角标点）、_norm 保留中文。"""
+
+    def test_norm_keeps_chinese(self):
+        self.assertEqual(ri._norm("张三"), "张三")
+        self.assertEqual(ri.normalize_title("中文标题测试"), "中文标题测试")
+        words = ri._title_words("儿童自闭症干预研究")
+        self.assertIn("儿童", words)   # 中文二元组
+        self.assertIn("自闭", words)
+
+    def test_parse_chinese_reference(self):
+        pr = ri.parse_numbered_reference("[1] 张三. 中文标题研究. 中华医学杂志. 2020.")
+        self.assertEqual(pr["authors"][0]["family"], "张三")
+        self.assertEqual(pr["title"], "中文标题研究")
+        self.assertEqual(pr["journal"], "中华医学杂志")
+        self.assertEqual(pr["year"], "2020")
+
+    def test_match_chinese_citations(self):
+        mapping = {"zhangsan2020": {"itemKey": "A1B2C3D4", "uri": "http://zotero.org/users/U/items/A1B2C3D4",
+                                    "csl": {"type": "article-journal", "title": "中文标题研究",
+                                            "author": [{"family": "张", "given": "三"}],
+                                            "issued": {"date-parts": [[2020]]}},
+                                    "doi": "10.x/1", "first_author": "张", "year": "2020"}}
+        by_year, nih = zfi.build_matcher(mapping)
+        for text in ["研究指出（张三，2020）。", "张三 (2020) 提出。", "参见（张三等，2020）。"]:
+            spans = zfi.find_citations(text, by_year, nih)
+            self.assertEqual(len(spans), 1, text)
+            self.assertEqual(spans[0][3], ["zhangsan2020"])
+
+    def test_chinese_end_to_end(self):
+        from docx import Document
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "s.docx"); out = os.path.join(td, "o.docx")
+            d = Document()
+            d.add_paragraph("研究指出（张三，2020）。")
+            d.add_paragraph("[1] 张三. 中文标题研究. 中华医学杂志. 2020.")
+            d.save(src)
+            mapping = {"zhangsan2020": {"itemKey": "A1B2C3D4", "uri": "http://zotero.org/users/U/items/A1B2C3D4",
+                                        "csl": {"type": "article-journal", "title": "中文标题研究",
+                                                "author": [{"family": "张", "given": "三"}],
+                                                "issued": {"date-parts": [[2020]]}},
+                                        "doi": "", "first_author": "张", "year": "2020"}}
+            cit_n, _ = zfi.insert_zotero_fields(src, out, (0, 1), [1], mapping,
+                                                uri_prefix="http://zotero.org/users/U/items/")
+            self.assertEqual(cit_n, 1)
+            ok, det = zfi.verify(out, ["A1B2C3D4"], src_docx=src, item_mapping=mapping)
+            self.assertTrue(ok, det)
+            self.assertEqual(det["cites"], 1)
+            self.assertEqual(det["missed_citations"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,8 +89,10 @@ print(verify("论文_zotero.docx", [m["itemKey"] for m in mapping.values()]))
 
 ## 校验
 
-`verify()` 检查：fldChar begin/separate/end 配对平衡、所有 JSON 合法、所有 URI 指向真实库
-条目、itemData 含 type/title/author/issued、显示文本与原文一致、引文零遗漏。
+`verify(out, valid_keys)` 检查：fldChar begin/separate/end 配对平衡、所有 JSON 合法、所有
+URI 指向真实库条目、itemData 含 type/title/author/issued。若传入 `src_docx` 与
+`item_mapping`,还会比对原文做**引文零遗漏 + 显示文本逐字一致**校验（在原文里用引文匹配器
+找出所有"作者+年份",逐一核对是否都出现在输出域的显示文本中）。
 
 ## 目录
 
