@@ -18,6 +18,15 @@ Zotero 打开时，引文和参考文献表都是"活的"。
 - **导入前去重**：按标题/DOI 检查库中是否已有相同条目，供用户选择跳过/新建/复用。
 - **逆向域代码格式**：直接改写 `word/document.xml`，其余 zip 部分原样保留。
 
+## 前置依赖
+
+本工具依赖 [Zotero](https://www.zotero.org/) 及其 MCP 服务，请先完成以下安装：
+
+1. **Zotero**（7.0+）：从 [zotero.org](https://www.zotero.org/) 下载安装。
+2. **Zotero MCP 插件**：基于 [cookjohn/zotero-mcp](https://github.com/cookjohn/zotero-mcp)（MIT，向作者 @cookjohn 致敬）。从其 [Releases](https://github.com/cookjohn/zotero-mcp/releases) 下载 `zotero-mcp-plugin-x.x.x.xpi`，在 Zotero 中 `工具 → 附加组件` 安装并重启，然后在 `首选项 → Zotero MCP Plugin` 中启用服务（默认端口 `23120`）。
+
+> 本仓库与 cookjohn/zotero-mcp 无隶属关系，仅作为下游使用者致谢。
+
 ## 安装
 
 ```bash
@@ -49,7 +58,7 @@ CROSSREF_MAILTO=CHANGE_ME
 ### Zotero MCP
 
 本工具通过本机 Zotero MCP 服务（Streamable HTTP，默认 `127.0.0.1:23120/mcp`）写入条目。
-请确保 Zotero 正在运行且已启用对应的 MCP 连接器。工作流开始时会自动探测，未就绪会提示。
+安装方式见上方[前置依赖](#前置依赖)。请确保 Zotero 正在运行且已启用 MCP 连接器，工作流开始时会自动探测，未就绪会提示。
 
 ## 工作流
 
@@ -91,7 +100,6 @@ print(verify("论文_zotero.docx", [m["itemKey"] for m in mapping.values()]))
 ├── zotero_field_insert.py   # 域代码插入器（引文匹配 + 域构造 + 校验）
 ├── zotero_mcp.py            # Zotero MCP 客户端（Streamable HTTP）
 ├── config.py                # 配置（env + 自动推导，无硬编码 ID）
-├── make_packages.py         # 打包脚本（个人版/开源版两个 zip）
 └── tests/                   # 单元测试
 ```
 
