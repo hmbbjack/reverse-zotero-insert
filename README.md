@@ -25,7 +25,7 @@ Zotero 打开时，引文和参考文献表都是"活的"。
 1. **Zotero**（7.0+）：从 [zotero.org](https://www.zotero.org/) 下载安装。
 2. **Zotero MCP 插件**：基于 [cookjohn/zotero-mcp](https://github.com/cookjohn/zotero-mcp)（MIT，向作者 @cookjohn 致敬）。从其 [Releases](https://github.com/cookjohn/zotero-mcp/releases) 下载 `zotero-mcp-plugin-x.x.x.xpi`，在 Zotero 中 `工具 → 附加组件` 安装并重启，然后在 `首选项 → Zotero MCP Plugin` 中启用服务（默认端口 `23120`）。
 
-> 本仓库与 cookjohn/zotero-mcp 无隶属关系，仅作为下游使用者致谢。
+> 本仓库与 cookjohn/zotero-mcp 无隶属关系，仅作为下游使用者使用。
 
 ## 安装
 
