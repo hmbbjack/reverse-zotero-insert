@@ -15,7 +15,10 @@ Zotero 打开时，引文和参考文献表都是"活的"。
 - **前置 MCP 配置检查**：工作流第一步自动探测 Zotero MCP 是否就绪，未就绪时提醒用户配置。
 - **强制用户检查点**：导入前向用户展示元数据汇总，并询问目标文件夹（列出现有 collection
   或新建），未获用户确认**绝不写入** Zotero。
-- **导入前去重**：按标题/DOI 检查库中是否已有相同条目，供用户选择跳过/新建/复用。
+- **导入前去重**：按标题/DOI 检查库中是否已有相同条目，供用户选择跳过/新建/复用；DOI 匹配经 `get_item_details` 详情确认（`search_library` 结果不含 DOI 字段）；导入幂等（重复导入自动转复用），导入后 `audit_imported_by_doi()` 审计残留重复。
+- **多种正文引用风格**：除"作者+年份"外，支持 `(doi:10.x; 10.y)` / `(10.x)` 裸 DOI 组占位正文（mapping 条目含 `doi` 即自动启用）与 `citation_text_map` 精确文本括号（FDA 说明书 / NCT / EU CT 等无 DOI 灰色文献）；表格"整列即 DOI"用 `refnum_column=None` 整格替换。
+- **以库为准**：`apply_library_data()` 用 Zotero 库内元数据重建域内嵌 itemData，避免 CrossRef 与库内数据（标题大小写/连字符/缺录字段）不一致。
+- **Word 标记透明化**：`<w:proofErr>` / `<w:lastRenderedPageBreak>` 不再切断引文组（此前跨标记的括号组会被整组漏转）。
 - **逆向域代码格式**：直接改写 `word/document.xml`，其余 zip 部分原样保留。
 
 ## 前置依赖
@@ -25,7 +28,7 @@ Zotero 打开时，引文和参考文献表都是"活的"。
 1. **Zotero**（7.0+）：从 [zotero.org](https://www.zotero.org/) 下载安装。
 2. **Zotero MCP 插件**：基于 [cookjohn/zotero-mcp](https://github.com/cookjohn/zotero-mcp)（MIT，向作者 @cookjohn 致敬）。从其 [Releases](https://github.com/cookjohn/zotero-mcp/releases) 下载 `zotero-mcp-plugin-x.x.x.xpi`，在 Zotero 中 `工具 → 附加组件` 安装并重启，然后在 `首选项 → Zotero MCP Plugin` 中启用服务（默认端口 `23120`）。
 
-> 本仓库与 cookjohn/zotero-mcp 无隶属关系，仅作为下游使用者使用。
+> 本仓库与 cookjohn/zotero-mcp 无隶属关系，仅作为下游使用者致谢。
 
 ## 安装
 
@@ -68,8 +71,10 @@ CROSSREF_MAILTO=CHANGE_ME
    `resolution_summary.json`（含置信度）。
 4. **去重检查**：`dedup_check()` 用 `search_library` 查重，产出 `dedup_report.json`。
 5. **强制检查点**：展示汇总表 + 询问目标文件夹（现有 collection 或新建），以及每篇重复的处置。
-6. **导入**：`import_to_zotero()` 写入 Zotero 到指定文件夹。
-7. **构建 mapping**：`build_item_mapping()` 产出 `item_mapping.json`。
+6. **导入**：`import_to_zotero()` 写入 Zotero 到指定文件夹（幂等；导入后
+   `audit_imported_by_doi()` 审计重复）。
+7. **构建 mapping**：`build_item_mapping()` 产出 `item_mapping.json`；复用库内条目时
+   `apply_library_data()` 以库内元数据重建 itemData。
 8. **插入域代码**：`zotero_field_insert.insert_zotero_fields()` + `verify()`。
 
 ```python
@@ -83,9 +88,15 @@ dup = dedup_check(resolved)                # dedup_report.json
 plan = {k: {"action": "import", "csl": v["csl"]} for k, v in resolved.items() if v["csl"]}
 imported = import_to_zotero(plan, "COLLECTION_KEY")
 mapping = build_item_mapping(imported)     # item_mapping.json
+mapping, doi_mismatch = apply_library_data(mapping)  # itemData 以库为准（复用条目时）
 insert_zotero_fields("论文.docx", "论文_zotero.docx", (1, 118), list(range(119, 180)), mapping)
 print(verify("论文_zotero.docx", [m["itemKey"] for m in mapping.values()]))
 ```
+
+> 占位符风格的正文（`(doi:10.x)` / `(10.x)` / `(FDA label, …)` / `(NCT…)` 等）：
+> mapping 条目含 `doi` 时 DOI 组匹配自动启用；无 DOI 的灰色文献占位传入
+> `citation_text_map={括号内文本: [ref_key]}`；表格"整列即 DOI"用
+> `insert_table_citations(..., refnum_column=None)` 或 `insert_zotero_fields(..., include_tables=True)`。
 
 ## 校验
 

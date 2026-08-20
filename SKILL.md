@@ -17,8 +17,8 @@ description: 当用户要求把参考文献以 Zotero 域代码格式插入/写�
 3. **批量解析元数据**：`reference_ingest.resolve_metadata()` 用 CrossRef/PubMed **搜索 API**（非 DOI 反查）逐条核实，产出 `resolution_summary.json`（含置信度 HIGH/UNKNOWN/LOW）。
 4. **去重检查**：`reference_ingest.dedup_check()` 用 MCP `search_library` 按标题/DOI 查重，产出 `dedup_report.json`（NEW/DUP/PROB-DUP）。
 5. **强制用户检查点（硬停）**：展示元数据汇总表，并**询问目标文件夹**（列出现有 collection + "新建文件夹"选项）与每篇重复的处置；低置信度条目先 `WebSearch` 复核。**未获用户对「目标文件夹 + 每篇去重处置 + 低置信度确认」的明确选择，不得调用 `write_item`/`add_items_to_collection`/`import_to_zotero`。**
-6. **导入 Zotero**：`reference_ingest.import_to_zotero(import_plan, collection_key)` 写入到用户选定的文件夹。
-7. **构建 mapping**：`reference_ingest.build_item_mapping()` 产出 `item_mapping.json`（格式与旧流程逐字节兼容）。
+6. **导入 Zotero**：`reference_ingest.import_to_zotero(import_plan, collection_key)` 写入到用户选定的文件夹（幂等：`precheck=True` 先查重，已有自动转复用）。导入后 `audit_imported_by_doi(resolved)` 审计重复（命中 >1 的条目列出让用户手动删，MCP 无删除工具）。
+7. **构建 mapping**：`reference_ingest.build_item_mapping()` 产出 `item_mapping.json`（格式与旧流程逐字节兼容）。复用库内条目时建议 `apply_library_data(item_mapping)` 以库内元数据重建 itemData（CrossRef 与库常有出入），并人工核对返回的 DOI 不一致清单。
 8. **强制检查点：引用格式/期刊选择**：向用户询问目标**期刊或通用引用格式**（如 Nature、IEEE、Vancouver、GB/T 7714、APA…）。`reference_ingest.resolve_style_id()` 命中内置别名则直接得 styleID；未命中则 Claude **联网搜索**该期刊对应的 Zotero CSL 样式，得到 `style_id`（及 locale）。**未获用户对格式的选择，不得插入域代码。**
 9. **插入域代码 + 校验**：`zotero_field_insert.insert_zotero_fields(..., style_id, style_locale)` + `verify()`。
 
@@ -59,13 +59,20 @@ Zotero 在 Word 文档（`word/document.xml`）中用三类域代码，存放在
 ## ⚠️ 避坑要点（实测踩过的坑）
 
 - **引文匹配过滤**：不要用 `Cohen`、`e.g.`、`i.e.` 等关键字过滤"非引文"括号组——`Cohen` 会误杀"Baron-Cohen"，`e.g.` 会误杀"(e.g., Smith, 2007)"。改为靠"作者姓+年份"验证来排除非引文。
+- **占位符风格的正文（DOI/注册号占位）**：手稿正文未必用"作者+年份"，可能是 `(doi:10.x; 10.y)`、`(10.x)`、`(FDA label, …)`、`(NCT…)`、`(EU CT …)`、`(公司, 年份)` 等。`find_citations` 只认作者-年份，对这类文档一无所获；用 `build_doi_matcher` + `find_doi_citations`（DOI 组）和 `citation_text_map`（精确文本括号）匹配，`insert_zotero_fields` 已内置（mapping 条目含 `doi` 即自动启用）。表格"整列即 DOI"用 `insert_table_citations(refnum_column=None)` 或 `include_tables=True`。
+- **Word 的 `<w:proofErr>` 会切断引文组**：Word 随文插入拼写/渲染标记（proofErr、lastRenderedPageBreak），若按普通元素切分文本块，跨标记的括号引文组会整组漏转（实测一份文档 262 处标记、漏掉 22 组）。转换器已把它们作透明节点丢弃，勿改回。
+- **`search_library` 结果不含 DOI 字段**：minimal 和 standard 模式都不返回 DOI。任何 DOI 匹配必须 `get_item_details(mode=complete)` 逐条确认，否则永远落空（曾因此漏检 4 个库内已有条目、重复导入）。
 - **重新生成尽量用干净原件**：生成器默认 `skip_existing=True`，会检测并跳过已含 Zotero 域的段落/域，支持"既有域代码又有纯文字"的混合文档，可安全地在原文件上处理。但若把"已写入域代码的文件"整份再走一次全量转换，仍可能重复写入——只对纯文字部分重新生成。
 - **多词姓氏**：De Vries、van Rijn、Orban de Xivry 等——匹配器要同时尝试"全姓"和"末词"。
 - **dontUpdate**：默认设 `false`，使引文随 Zotero 里选择的样式自动重排（用户改样式后刷新即可生效）。只有在需要"冻结"某条引文外观、不让 Zotero 重排时才设 `true`（此时该条引文被标记为手动编辑，不会随样式变化）。注意：表格里 Ref# 列若显示"[1]"，`dontUpdate:false` 下改用 APA 样式刷新会变成"(Choi et al., 2016)"--若想保持数字编号，选用数字型样式(IEEE/Vancouver)即可。
 - **域代码 JSON 转义**：写入 `<w:instrText>` 时对 `&` `<` `>` 做 XML 转义。
-- **`write_item` 参数位置**：`itemType` 必须是**顶层**参数，不能放进 `fields`（放进 fields 会报错）；`creators` 是独立列表。
-- **无 `delete_item` 工具**：去重只能靠 skip/reuse/import-as-new，**绝不删除**已有条目。
-- **去重可能多轮**：`search_library` 按相关度排序，首个 probable 命中可能掩盖第二个重复。按标题 AND DOI 联合查询；导入一轮后对新建 key 再跑一次 `dedup_check`，上限 2 轮。
+- **`write_item` 参数位置**：`itemType` 必须是**顶层**参数，不能放进 `fields`（放进 fields 会报错）；`creators` 是独立列表，且**空列表必须整个省略**（Zotero 报 "Creator names cannot be empty"，会让批量导入中途崩掉；导入默认 `precheck=True` 幂等，中途失败重跑不会重复建条目）。
+- **无 `delete_item` 工具**：去重只能靠 skip/reuse/import-as-new，**绝不删除**已有条目；导入后用 `audit_imported_by_doi()` 审计重复（命中数 >1 只能列出让用户手动清理）。
+- **去重可能多轮**：`search_library` 按相关度排序，首个 probable 命中可能掩盖第二个重复。标题大小写/Unicode 连字符差异会让标题搜索漏掉库内条目，所以标题未 exact 命中时**总是**再走 DOI 路径（详情确认）。
+- **复用库内条目时以库为准**：CrossRef 数据与库内常有出入（标题大小写、连字符、缺录 DOI/卷期页）。插入前用 `apply_library_data(item_mapping)` 把 itemData 重建为库内元数据；返回的 DOI 不一致清单要人工核对（多为库内错录或 DOI 笔误）。
+- **CrossRef 标题含 HTML 标记**：`<i>…</i>` 等（`crossref_to_csl` 已自动剥除）；自己解析时记得清理，否则标记会写进 Zotero 标题。
+- **死链 DOI**：DOI 404 多为笔误（如 `…-020-20296-5` vs `…-020-20604-3`）。`resolve_metadata` 以 `resolve_error` 显式标记，勿静默跳过--结合上下文用 CrossRef 搜索找正确 DOI，向用户确认后替换（含正文文字）。
+- **verify 与 abstract**：真实 Zotero 域经常内嵌 abstract，不算缺陷（`with_abstract` 仅计数提示）；但新生成的域仍应剔除 abstract（生成器已做）。
 - **限流**：CrossRef 礼貌池 ~1/1.2s、NCBI ~1/0.4s；429 退避重试。CrossRef 用 `CROSSREF_MAILTO` 降低限流，NCBI 用 `NCBI_API_KEY`。
 
 ## 脚本
@@ -77,7 +84,8 @@ Zotero 在 Word 文档（`word/document.xml`）中用三类域代码，存放在
 ```python
 # 阶段一：前端摄取（纯文字编号参考文献 -> Zotero 库 -> item_mapping.json）
 from reference_ingest import check_zotero_mcp, extract_reference_paragraphs, \
-    resolve_metadata, dedup_check, import_to_zotero, build_item_mapping
+    resolve_metadata, dedup_check, import_to_zotero, build_item_mapping, \
+    audit_imported_by_doi, apply_library_data
 
 check_zotero_mcp()                              # 前置 MCP 配置检查（未就绪则提醒用户）
 refs = extract_reference_paragraphs('论文.docx') # 解析编号参考文献
@@ -87,7 +95,9 @@ dup = dedup_check(resolved)                     # 去重检查 -> dedup_report.j
 plan = {k: {"action": "import", "csl": v["csl"]} for k, v in resolved.items() if v["csl"]}
 imported, warnings = import_to_zotero(plan, 'COLLECTION_KEY')  # 用户选定的文件夹
 if warnings: print(warnings)  # 若有 write_item 未取到 key 的条目，需人工处理
+audit = audit_imported_by_doi(resolved)        # 导入后审计重复 -> doi_audit.json
 item_mapping = build_item_mapping(imported)     # -> item_mapping.json
+item_mapping, doi_mismatch = apply_library_data(item_mapping)  # 以库为准重建 itemData
 
 # 阶段二：域代码插入 + 校验
 from zotero_field_insert import insert_zotero_fields, verify
@@ -103,6 +113,8 @@ insert_zotero_fields(
     item_mapping=item_mapping,          # {ref_key: {itemKey, uri, csl, doi}}
     style_id=style_id,
     style_locale=style_locale,
+    # 占位符风格正文（可选）：citation_text_map={'FDA label, minocycline': ['fdamino'], ...}
+    # 表格"整列即 DOI"时加 include_tables=True
 )
 ```
 

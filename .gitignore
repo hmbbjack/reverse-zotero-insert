@@ -5,6 +5,7 @@ config.local.env
 resolution_summary.json
 dedup_report.json
 item_mapping.json
+doi_audit.json
 论文_zotero.docx
 *.docx
 !tests/

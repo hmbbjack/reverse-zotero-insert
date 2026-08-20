@@ -19,6 +19,7 @@ zotero_mcp.call_tool（作为 zotero callable 传入，默认 zotero_mcp.call_to
   -> dedup_check -> [强制检查点] -> import_to_zotero -> build_item_mapping
 """
 import json
+import html
 import re
 import time
 import random
@@ -417,12 +418,22 @@ def _map_type(t):
     return m.get(t, "article-journal")
 
 
+def _clean_crossref_text(s):
+    """CrossRef 字段常内嵌 <i>…</i> 等 HTML 标记和 HTML 实体；
+    不清理会把标记原样写进 Zotero 标题（如 "Late <i>N</i>-acetylcysteine…"）。"""
+    if not s:
+        return s
+    s = re.sub(r'<[^>]+>', '', str(s))
+    s = html.unescape(s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 def crossref_to_csl(item):
-    """CrossRef item -> CSL-JSON（type/title/author/issued，无 abstract）。"""
+    """CrossRef item -> CSL-JSON（type/title/author/issued，无 abstract）。标题/期刊名已剥 HTML。"""
     csl = {"type": _map_type(item.get("type", ""))}
     title = item.get("title")
     if title:
-        csl["title"] = title[0] if isinstance(title, list) else title
+        csl["title"] = _clean_crossref_text(title[0] if isinstance(title, list) else title)
     authors = []
     for a in item.get("author", []):
         if a.get("family"):
@@ -436,7 +447,7 @@ def crossref_to_csl(item):
         csl["issued"] = {"date-parts": issued}
     ct = item.get("container-title")
     if ct:
-        csl["container-title"] = ct[0] if isinstance(ct, list) else ct
+        csl["container-title"] = _clean_crossref_text(ct[0] if isinstance(ct, list) else ct)
     for f in ("volume", "issue", "page", "publisher"):
         if item.get(f):
             csl[f] = item[f]
@@ -542,6 +553,7 @@ def resolve_metadata(refs, providers=("crossref", "pubmed")):
             "confidence": best_score,
             "candidates": candidates[:5],
             "parsed": parsed,
+            "resolve_error": best is None,  # 显式标记解析失败（如 DOI 死链），勿静默跳过
         }
     _write_json("resolution_summary.json", _summarize(resolved))
     return resolved
@@ -553,7 +565,8 @@ def _summarize(resolved):
                 "year": _year(v["csl"]),
                 "provider": v["provider"],
                 "confidence": v["confidence"],
-                "level": _confidence_level(v["confidence"])}
+                "level": _confidence_level(v["confidence"]),
+                "resolve_error": v.get("resolve_error", False)}
             for k, v in resolved.items()}
 
 
@@ -571,8 +584,43 @@ def normalize_title(s):
     return _norm(s)
 
 
+def _results(res):
+    if isinstance(res, dict) and isinstance(res.get("results"), list):
+        return res["results"]
+    return []
+
+
+def _search_results(zotero, q, mode="standard", limit=5):
+    res = zotero("search_library", {"q": q, "mode": mode, "limit": limit})
+    return _results(res)
+
+
+def _doi_search(zotero, doi):
+    """按 DOI 全文搜索并用 get_item_details 逐条确认。
+
+    ⚠️ search_library 的 minimal/standard 结果都**不含 DOI 字段**：
+    旧实现拿 minimal 结果直接比 it["DOI"]，永远落空 -> 漏检库中已有条目 -> 重复导入
+    （且 MCP 没有 delete_item，重复只能手动清理）。必须 fetch 详情确认。"""
+    hits = []
+    for it in _search_results(zotero, f'"{doi}"'):
+        key = it.get("key")
+        if not key:
+            continue
+        try:
+            det = zotero("get_item_details", {"itemKey": key, "mode": "complete"})
+        except Exception:
+            continue
+        if isinstance(det, dict) and key == det.get("key", key) and \
+                str(det.get("DOI", "")).strip().lower() == doi.lower():
+            det["key"] = key
+            hits.append(det)
+    return hits
+
+
 def dedup_check(resolved, collection_key=None, zotero=None):
-    """逐篇 search_library 查重。返回 {ref_key: {status, existing}}。不导入。"""
+    """逐篇查重。标题路径（minimal 搜索 + 归一化比对）+ DOI 路径（全文搜索 + 详情确认）。
+    标题无 exact 命中时**总是**再走 DOI 路径（标题大小写/Unicode 连字符差异会让标题
+    搜索漏掉库内条目）。返回 {ref_key: {status, existing}}。不导入。"""
     zotero = _get_zotero(zotero)
     report = {}
     for key, info in resolved.items():
@@ -593,14 +641,12 @@ def dedup_check(resolved, collection_key=None, zotero=None):
                     break
                 elif hit == "probable" and status != "exact":
                     status, existing = "probable", it
-        # 补充 DOI 匹配
-        if status == "none" and csl.get("DOI"):
-            doi = csl["DOI"].lower()
-            res = zotero("search_library", {"q": doi, "mode": "minimal", "limit": 5})
-            for it in _results(res):
-                if (it.get("DOI") or "").lower() == doi:
-                    status, existing = "exact", it
-                    break
+        # DOI 路径：标题未 exact 命中就尝试（probable 也升级确认）。minimal 结果没有
+        # DOI 字段，_doi_search 内部会逐条 get_item_details 确认，不会误判。
+        if status != "exact" and csl.get("DOI"):
+            hits = _doi_search(zotero, csl["DOI"])
+            if hits:
+                status, existing = "exact", hits[0]
         report[key] = {
             "status": status,
             "existing": _existing_meta(existing) if existing else None,
@@ -609,10 +655,21 @@ def dedup_check(resolved, collection_key=None, zotero=None):
     return report
 
 
-def _results(res):
-    if isinstance(res, dict) and isinstance(res.get("results"), list):
-        return res["results"]
-    return []
+def audit_imported_by_doi(resolved, zotero=None):
+    """导入后审计：逐 DOI 全文搜索库内命中数。
+
+    命中数 >1 说明库内存在重复（MCP 无删除工具，只能列出让用户在 Zotero UI 里
+    手动清理）。返回 {ref_key: {"hits": n, "keys": [...]}}，写 doi_audit.json。"""
+    zotero = _get_zotero(zotero)
+    report = {}
+    for key, info in resolved.items():
+        doi = info.get("csl", {}).get("DOI") or info.get("doi")
+        if not doi:
+            continue
+        keys = [it["key"] for it in _doi_search(zotero, doi)]
+        report[key] = {"hits": len(keys), "keys": keys}
+    _write_json("doi_audit.json", report)
+    return report
 
 
 def _existing_meta(it):
@@ -716,10 +773,29 @@ def _extract_item_key(res):
     return None
 
 
-def import_to_zotero(import_plan, collection_key, zotero=None, uri_prefix=None):
+def _find_existing_item(csl, zotero):
+    """导入前按 DOI/标题查库内是否已有该条目（幂等导入用）。
+    返回 itemKey 或 None。DOI 路径走 _doi_search（详情确认），标题路径走归一化比对。"""
+    doi = csl.get("DOI")
+    if doi:
+        hits = _doi_search(zotero, doi)
+        if hits:
+            return hits[0]["key"]
+    nt = normalize_title(csl.get("title", ""))
+    if nt:
+        res = zotero("search_library", {"q": csl.get("title", ""), "mode": "minimal", "limit": 5})
+        for it in _results(res):
+            if normalize_title(it.get("title", "")) == nt:
+                return it.get("key")
+    return None
+
+
+def import_to_zotero(import_plan, collection_key, zotero=None, uri_prefix=None, precheck=True):
     """按用户批准的计划导入。import_plan = {ref_key: {action, csl, zotero_key?}}。
 
     action: 'import' 新建 / 'reuse' 复用库中已有(zotero_key) / 'skip' 跳过。
+    precheck=True 时 'import' 动作先按 DOI/标题查重，已有则自动转为复用--
+    批量导入中途失败后重跑不会重复建条目（MCP 无删除工具，重复只能手动清理）。
     返回 (imported, warnings)。imported = {ref_key: {itemKey, uri, csl}}；
     warnings 列出 write_item 后未能提取到 key 的条目（避免静默丢失）。
     """
@@ -743,12 +819,24 @@ def import_to_zotero(import_plan, collection_key, zotero=None, uri_prefix=None):
                 warnings.append(f"{key}: reuse 但未提供 zotero_key")
             continue
         # action == 'import'：新建
-        res = zotero("write_item", {
+        if precheck:
+            zk = _find_existing_item(csl, zotero)
+            if zk:
+                items_to_add.append(zk)
+                imported[key] = {"itemKey": zk, "uri": uri_prefix + zk, "csl": csl,
+                                 "precheck_reused": True}
+                continue
+        args = {
             "action": "create",
             "itemType": _csl_to_itemtype(csl),  # 必须顶层参数，不能放进 fields
             "fields": _csl_to_field_map(csl),
-            "creators": _csl_to_creators(csl),
-        })
+        }
+        creators = _csl_to_creators(csl)
+        if creators:
+            # ⚠️ 空列表必须整个省略：Zotero 对空 creators 报
+            # "Creator names cannot be empty"，会让批量导入中途崩掉（部分条目已建）
+            args["creators"] = creators
+        res = zotero("write_item", args)
         zk = _extract_item_key(res)
         if zk:
             items_to_add.append(zk)
@@ -784,6 +872,88 @@ def build_item_mapping(imported, uri_prefix=None):
             "year": _year(csl),
         }
     return mapping
+
+
+# ---------- 以库为准：用 Zotero 库内元数据重建 itemData ----------
+def _parse_lib_date(d):
+    """库内 date 形如 "2008" / "2023-01" / "2026-05-13" -> date-parts 列表。"""
+    if not d:
+        return None
+    m = re.match(r'^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?', str(d).strip())
+    if not m:
+        return None
+    parts = [int(m.group(1))]
+    if m.group(2):
+        parts.append(int(m.group(2)))
+    if m.group(3):
+        parts.append(int(m.group(3)))
+    return parts
+
+
+def _lib_details_to_csl(det, fallback_type="article-journal"):
+    """get_item_details(complete) 的返回 -> CSL-JSON（域内嵌 itemData 用）。
+    条目类型沿用库内 itemType（详情缺失时退回 fallback_type）。"""
+    itype = (det.get("itemType") or "").strip()
+    csl = {"type": "report" if itype == "report" else fallback_type}
+    if det.get("title"):
+        csl["title"] = det["title"]
+    authors = []
+    for c in det.get("creators", []) or []:
+        ln, fn = c.get("lastName", ""), c.get("firstName", "")
+        if ln and fn:
+            authors.append({"family": ln, "given": fn})
+        elif fn and not ln:
+            authors.append({"literal": fn})
+        elif ln:
+            # Zotero 组织作者把单位名放 lastName、firstName 为空——按 CSL 机构作者用 literal。
+            # （真实 Zotero 域内嵌 itemData 对组织作者即为 {"literal": "…"}）
+            authors.append({"literal": ln})
+    if authors:
+        csl["author"] = authors
+    dp = _parse_lib_date(det.get("date"))
+    csl["issued"] = {"date-parts": [dp]} if dp else {"date-parts": [[]]}
+    if csl["type"] != "report":
+        for src, dst in (("publicationTitle", "container-title"), ("volume", "volume"),
+                         ("issue", "issue"), ("pages", "page")):
+            if det.get(src):
+                csl[dst] = det[src]
+    if det.get("DOI"):
+        csl["DOI"] = det["DOI"]
+    if det.get("url"):
+        csl["URL"] = det["url"]
+    return csl
+
+
+def apply_library_data(item_mapping, zotero=None, update_doi_field=False):
+    """以 Zotero 库内元数据为准，重建 mapping 中每条的 csl（域内嵌 itemData 用）。
+
+    复用库中已有条目时，CrossRef 数据与库内常有出入（标题大小写、Unicode 连字符、
+    缺录的 DOI/卷期页等）；插入域代码前跑一遍本函数，itemData 即与库一致，
+    Zotero 刷新前后表现稳定。
+    返回 (mapping, doi_mismatches)；doi_mismatches = [(ref_key, mapping_doi, lib_doi)]
+    （mapping 的 doi 锚点保持不变，只用于正文匹配）。"""
+    zotero = _get_zotero(zotero)
+    mismatches = []
+    for ref_key, v in item_mapping.items():
+        zk = v.get("itemKey")
+        if not zk:
+            continue
+        try:
+            det = zotero("get_item_details", {"itemKey": zk, "mode": "complete"})
+        except Exception:
+            continue
+        if not isinstance(det, dict) or not det.get("title"):
+            continue
+        lib_doi = str(det.get("DOI", "")).strip()
+        map_doi = str(v.get("doi", "")).strip()
+        if lib_doi and map_doi and lib_doi.lower() != map_doi.lower():
+            mismatches.append((ref_key, map_doi, lib_doi))
+        v["csl"] = _lib_details_to_csl(det, fallback_type=v.get("csl", {}).get("type", "article-journal"))
+        v["first_author"] = _first_author_lastname(v["csl"]) or v.get("first_author", "")
+        v["year"] = _year(v["csl"]) or v.get("year", "")
+        if update_doi_field and lib_doi:
+            v["doi"] = lib_doi
+    return item_mapping, mismatches
 
 
 # ---------- 非交互兜底编排 ----------
