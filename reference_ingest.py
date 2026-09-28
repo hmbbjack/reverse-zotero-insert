@@ -585,8 +585,20 @@ def normalize_title(s):
 
 
 def _results(res):
-    if isinstance(res, dict) and isinstance(res.get("results"), list):
-        return res["results"]
+    """把 MCP 各工具五花八门的返回形态统一成条目列表。
+
+    ⚠️ 形态不统一是实测过的坑：search_library 返回 {"results": [...]}，
+    get_collection_items / get_collection_items 树 直接返回**数组**，
+    另有 {"items": [...]}。旧实现只认 dict+results，遇到数组一律返回 []，
+    于是"按文件夹建库索引"会静默建出空索引（v3 回归实测：285 条的文件夹返回 0 条，
+    0 失败，看起来一切正常）。
+    """
+    if isinstance(res, list):
+        return res
+    if isinstance(res, dict):
+        for k in ("results", "items", "data"):
+            if isinstance(res.get(k), list):
+                return res[k]
     return []
 
 
@@ -611,10 +623,154 @@ def _doi_search(zotero, doi):
         except Exception:
             continue
         if isinstance(det, dict) and key == det.get("key", key) and \
-                str(det.get("DOI", "")).strip().lower() == doi.lower():
+                normalize_doi(det.get("DOI")) == normalize_doi(doi):
             det["key"] = key
             hits.append(det)
     return hits
+
+
+def normalize_doi(doi):
+    """DOI 归一化：去前缀、去尾随标点、转小写。老式括号 DOI（(98)00014-6）原样保留。
+
+    手稿里的 DOI 写法五花八门：`https://doi.org/10.x`、`doi:10.x`、`10.x.`、
+    `(doi:10.x; 10.y)` 的分片、`10.1016/S0306-4530(98)00014-6`。
+    直接用原串查库必然漏命中。所有比对路径都应先过这个函数。
+    """
+    if not doi:
+        return ""
+    s = str(doi).strip()
+    s = re.sub(r'^[\s(（]+', '', s)                       # 前导分组括号
+    s = re.sub(r'^(?:https?://(?:dx\.)?doi\.org/|doi\s*[:：]\s*)', '', s, flags=re.I)
+    s = s.strip().rstrip('.,;')
+    # 尾部括号属于分组而非 DOI；老式 DOI 自身以 (98) 结尾的年份段要保留
+    while s and s[-1] in ')）' and not re.search(r'\(\d{2}[A-Za-z0-9]?\)$', s):
+        s = s[:-1].rstrip()
+    return s.lower()
+
+
+def _collection_item_keys(zotero, collection_key):
+    res = zotero("get_collection_items", {"collectionKey": collection_key, "limit": 500})
+    return [it.get("key") for it in _results(res) if it.get("key")]
+
+
+def build_library_doi_index(collection_keys=None, item_keys=None, zotero=None,
+                            progress_every=0, csl_builder=None):
+    """把 Zotero 库（指定文件夹 / 指定 key 集合）建成 {归一化DOI: {itemKey, uri, title, csl}}。
+
+    **绝不静默跳过失败**：get_item_details 对已删除条目会返回 {'error': ...}，
+    旧写法 `except/if error: continue` 会把这类条目悄悄丢掉，索引看着"很干净"，
+    实际漏掉了死链（v2 实测：422 个 key 全部"成功"，但文档里引用的一条已删条目
+    从未进入索引，直到最后单独校验 key 存在性才暴露）。
+    返回 (index, failures, dups)：
+      failures: [(key, error)] —— 必须报告给用户
+      dups:     {doi: [key, ...]} —— 同 DOI 多条目，需用户决定合并到哪条
+    """
+    zotero = _get_zotero(zotero)
+    if item_keys is None:
+        keys = []
+        for ck in (collection_keys or []):
+            keys.extend(_collection_item_keys(zotero, ck))
+        item_keys = sorted(set(keys))
+    index, failures, dups = {}, [], {}
+    for i, k in enumerate(item_keys or [], 1):
+        try:
+            det = zotero("get_item_details", {"itemKey": k, "mode": "complete"})
+        except Exception as e:
+            failures.append((k, f"{type(e).__name__}: {e}"))
+            continue
+        if not isinstance(det, dict) or det.get("error") or not det.get("title"):
+            failures.append((k, str(det)[:120] if isinstance(det, dict) else "bad response"))
+            continue
+        d = normalize_doi(det.get("DOI") or "")
+        if not d:
+            continue
+        if d in index:
+            dups.setdefault(d, [index[d]["itemKey"]]).append(k)
+            continue
+        index[d] = {
+            "itemKey": k,
+            "uri": f"http://zotero.org/users/{_zotero_user_id()}/items/{k}",
+            "doi": det.get("DOI") or d,
+            "title": det.get("title", ""),
+            "csl": csl_builder(det) if csl_builder else {},
+            "itemType": det.get("itemType", ""),
+        }
+        if progress_every and i % progress_every == 0:
+            print(f"  …{i}/{len(item_keys)}", flush=True)
+    return index, failures, dups
+
+
+def _zotero_user_id():
+    try:
+        return config.get_user_id()
+    except Exception:
+        return "local"
+
+
+def verify_item_keys(keys, zotero=None, progress_every=0):
+    """校验 itemKey 集合在库内是否真实存在（死链审计）。
+
+    返回 (ok_keys, missing)：missing 为 [(key, error)]。转换交付前的必查项——
+    既有域可能指向用户早已删除的条目，Zotero 刷新后会显示 [item removed]。
+    修法：找到库内同 DOI 的规范条目后用 docx_audit.relink_item_keys() 重链接。
+    """
+    zotero = _get_zotero(zotero)
+    ok, missing = [], []
+    keys = sorted(set(keys or []))
+    for i, k in enumerate(keys, 1):
+        try:
+            det = zotero("get_item_details", {"itemKey": k, "mode": "minimal"})
+            bad = (not isinstance(det, dict) or det.get("error")
+                   or not det.get("title"))
+        except Exception as e:
+            bad, det = True, {"error": str(e)[:80]}
+        (missing.append((k, str(det.get('error'))[:100])) if bad else ok.append(k))
+        if progress_every and i % progress_every == 0:
+            print(f"  …{i}/{len(keys)}", flush=True)
+    return ok, missing
+
+
+def doc_item_dois(docx_path, zotero=None, csl_builder=None):
+    """文档既有引文域引用的条目 -> {归一化DOI: {itemKey, uri, title, csl}}。
+
+    "半刷新"手稿（部分段落已是域、部分仍是 DOI 占位）的映射必须取
+    **占位 DOI ∪ 既有域引用** 的并集：只被既有域引用的文献不在占位集合里，
+    少了它们，校验会把合法既有域误判为映射外。
+    """
+    try:
+        import docx_audit
+    except ImportError:
+        docx_audit = None
+    import zipfile as _zipfile
+    from lxml import etree as _etree
+    if docx_audit is not None:
+        root = docx_audit.etree.fromstring(
+            _zipfile.ZipFile(docx_path).read('word/document.xml'))
+        keys = docx_audit.zfi.document_item_keys(root)
+    else:
+        from zotero_field_insert import document_item_keys
+        root = _etree.fromstring(_zipfile.ZipFile(docx_path).read('word/document.xml'))
+        keys = document_item_keys(root)
+    idx, failures, dups = {}, [], {}
+    zotero = _get_zotero(zotero)
+    for k in sorted(keys):
+        try:
+            det = zotero("get_item_details", {"itemKey": k, "mode": "complete"})
+        except Exception as e:
+            failures.append((k, f"{type(e).__name__}: {e}"))
+            continue
+        if not isinstance(det, dict) or det.get("error") or not det.get("title"):
+            failures.append((k, "not found"))
+            continue
+        d = normalize_doi(det.get("DOI") or "")
+        if not d:
+            continue
+        idx[d] = {"itemKey": k,
+                  "uri": f"http://zotero.org/users/{_zotero_user_id()}/items/{k}",
+                  "doi": det.get("DOI") or d,
+                  "title": det.get("title", ""),
+                  "csl": csl_builder(det) if csl_builder else {}}
+    return idx, failures, dups
 
 
 def dedup_check(resolved, collection_key=None, zotero=None):

@@ -151,9 +151,13 @@ def find_citations(text, by_year, nih_key):
 # ---------- DOI/精确文本括号引文（占位符风格正文） ----------
 # 适用于正文用 "(doi:10.x; 10.y)"、"(10.x; 10.y)"、"(FDA label, …)"、"(NCT…)"、
 # "(Kynexis, 2024)" 等占位代替"作者+年份"的手稿。作者-年份匹配器对这类文档一无所获。
-_PAREN_ANY = re.compile(r'[（(]([^（）()]*)[）)]')
-_DOI_PART = re.compile(r'^(?:doi[:：]\s*)?(10\.\d{4,9}/\S+?)\.?$', re.I)
-_STANDALONE_DOI = re.compile(r'^\s*((?:doi[:：]\s*)?10\.\d{4,9}/\S+?)[.;]?\s*$', re.I)
+# DOI 词元：老式 Elsevier DOI 内含年份段括号，如 10.1016/S0306-4530(98)00014-6。
+# 朴素的 `10\.\d{4,9}/[^\s,;)]+` 会把它截断成 "10.1016/s0306-4530"（丢掉 (98)00014-6），
+# 导致占位提取与整格匹配双双漏转。这里用"非括号段 或 (YY)x 年份段"来完整吃掉。
+_DOI_TOKEN = r'10\.\d{4,9}/(?:[^\s,;；()"\']+|\([0-9]{2}[A-Za-z0-9]?\))+'
+_PAREN_ANY = re.compile(r'[（(]((?:[^（）()]|\([^（）()]*\))*)[）)]')
+_DOI_PART = re.compile(r'^(?:doi[:：]\s*)?(' + _DOI_TOKEN + r')[.;]?$', re.I)
+_STANDALONE_DOI = re.compile(r'^\s*[（(]?\s*((?:doi[:：]\s*)?' + _DOI_TOKEN + r')\s*[）)]?\s*[.;]?\s*$', re.I)
 
 
 def build_doi_matcher(item_mapping):
@@ -162,11 +166,14 @@ def build_doi_matcher(item_mapping):
 
 
 def find_doi_citations(text, doi2key, text_map=None):
-    """DOI 组括号引文 + 精确文本括号引文。返回与 find_citations 同构的
-    [(start, end, display, [ref_key])]。
+    """DOI 组括号引文 + 混合括号（作者-年份 + DOI）+ 精确文本括号引文。
+    返回与 find_citations 同构的 [(start, end, display, [ref_key])]。
 
     - DOI 组：括号内以 ; 分隔的每个分片都是 DOI（doi: 前缀可有可无）；
       组内任一 DOI 不在 mapping -> 整组跳过（保守，避免半转换）。
+    - 混合括号：括号内**非全 DOI**但包含至少一个可解析 DOI（如 "(Gao et al., 2014;
+      doi:10.1016/...)"）。此时整括号转成引文域，citationItems = 括号内所有可解析
+      DOI 对应条目；任一 DOI 不在 mapping -> 整组跳过。
     - text_map: {括号内文本(strip): [ref_key]}，如 {"FDA label, minocycline": ["fdamino"]}，
       用于无 DOI 的灰色文献占位（FDA 说明书 / NCT / EU CT / 公司通讯等）。"""
     out = []
@@ -187,6 +194,27 @@ def find_doi_citations(text, doi2key, text_map=None):
             if keys:
                 out.append((m.start(), m.end(), m.group(0), keys))
             continue
+        # 混合括号：非全 DOI 但含可解析 DOI（作者-年份 + DOI 同括号）
+        # v3 安全约束：分片只要"看起来像 DOI"（以 10. / doi: 开头）却解析不出或
+        # 查不到条目，整组跳过——否则 (10.x/known; 10.broken/z) 会被静默截断成
+        # 只引 known 那条，另一条证据凭空消失（v2 实测的隐患）。
+        mixed_keys = []
+        for p in parts:
+            mm = _DOI_PART.match(p)
+            looks_doi = bool(re.match(r'^\s*(?:doi[:：]\s*)?10\.', p, re.I))
+            if mm:
+                k = doi2key.get(mm.group(1).lower())
+                if not k:
+                    mixed_keys = None
+                    break
+                mixed_keys.append(k)
+            elif looks_doi:
+                mixed_keys = None      # 形似 DOI 却无法解析 -> 整组放弃
+                break
+            # 非 DOI 分片（作者-年份等）忽略，但仍要求括号内至少含一个 DOI
+        if mixed_keys:
+            out.append((m.start(), m.end(), m.group(0), mixed_keys))
+            continue
         if text_map and inner.strip() in text_map:
             out.append((m.start(), m.end(), m.group(0), list(text_map[inner.strip()])))
     return out
@@ -198,7 +226,10 @@ def match_standalone_doi(text, doi2key):
     m = _STANDALONE_DOI.match(text or '')
     if not m:
         return None
-    k = doi2key.get(m.group(1).lower())
+    raw = m.group(1).lower()
+    # 剥离可选的 doi: 前缀再查映射（build_doi_matcher 的 key 是纯 DOI，不带前缀）
+    raw = re.sub(r'^doi[:：]\s*', '', raw, flags=re.I)
+    k = doi2key.get(raw)
     if not k:
         return None
     return k, text
@@ -320,6 +351,167 @@ def detect_zotero_fields(docx_path):
     return _detect_existing(root.find(W + 'body'))
 
 
+# ---------- 规范化域收集 / 域外文本 / 审计原语（v3） ----------
+# 本节所有函数都以 **文档级** 顺序遍历（root.iter 顺序即文档顺序），域深度在段落之间
+# 连续传递。历史上最容易出错的两个坑都源于"逐段重置深度"或"逐元素解析 JSON"：
+#   1) Zotero 文献表域（BIBL）跨成百上千个段落，逐段重置深度会把文献表正文误判成
+#      "域外裸 DOI"，虚增上百条假命中；域外残留扫描同样会误报。
+#   2) Word/Zotero 会把一个域的指令拆成多个 <w:instrText>，必须域级拼接后再 json.loads。
+
+def collect_fields(root, with_display=True):
+    """域级收集文档中所有域。返回 [(instrText元素列表, 显示文本, 起始段落序号)]。
+
+    - 深度跨段落连续传递：跨段域（BIBL/长 PREF）也能正确收口。
+    - instrText 存 **元素**（不是字符串），便于就地重写（重编号/重链接）。
+    - 显示文本 = begin..separate..end 之间的 w:t 拼接；无 separate 时为空串。
+    """
+    fields = []
+    depth = 0; cur = None; disp = []; state = 'pre'; start_para = -1; para_i = -1
+    for p in root.iter(W + 'p'):
+        para_i += 1
+        for r in p.iter(W + 'r'):
+            for ch in r:
+                tg = etree.QName(ch).localname
+                if tg == 'fldChar':
+                    ft = ch.get(W + 'fldCharType')
+                    if ft == 'begin':
+                        depth += 1
+                        if depth == 1:
+                            cur = []; disp = []; state = 'instr'; start_para = para_i
+                    elif ft == 'separate':
+                        if depth >= 1: state = 'disp'
+                    elif ft == 'end':
+                        if depth == 1 and cur is not None:
+                            fields.append((cur, ''.join(disp) if with_display else '',
+                                           start_para))
+                            cur = None
+                        depth = max(0, depth - 1)
+                elif tg == 'instrText' and depth >= 1 and state == 'instr' and cur is not None:
+                    cur.append(ch)
+                elif tg == 't' and depth >= 1 and state == 'disp' and with_display:
+                    disp.append(ch.text or '')
+    return fields
+
+
+def field_instr_text(els):
+    """域级 instrText 拼接（跨 run / 跨 instrText 元素）。"""
+    return ''.join(e.text or '' for e in els)
+
+
+def field_payload(els):
+    """解析域指令里的 JSON（CSL_CITATION / ZOTERO_BIBL / PREFERENCES 通用）。失败返回 None。"""
+    t = field_instr_text(els)
+    m = re.search(r'\{.*\}', t, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def outside_field_paragraphs(root):
+    """产出 (段落序号, 域外文本) —— 深度跨段连续传递，域内文本（引文缓存/文献表）不计。
+
+    用途：找"真正的纯文字占位"。既有域的显示文本里常含 DOI 字样（显示文本=原文的
+    转换结果），必须排除，否则会把已转换的引文误报成漏转。
+    """
+    depth = 0; para_i = -1
+    for p in root.iter(W + 'p'):
+        para_i += 1
+        parts = []
+        for r in p.iter(W + 'r'):
+            for ch in r:
+                tg = etree.QName(ch).localname
+                if tg == 'fldChar':
+                    ft = ch.get(W + 'fldCharType')
+                    if ft == 'begin': depth += 1
+                    elif ft == 'end': depth = max(0, depth - 1)
+                elif tg == 't' and depth == 0:
+                    parts.append(ch.text or '')
+        yield para_i, ''.join(parts)
+
+
+def _is_placeholder_doi(text):
+    """域外文本里是否还留着 DOI 占位（doi: 前缀式或裸 DOI）。"""
+    return bool(re.search(r'doi[:：]?\s*10\.\d{4,9}/', text or '', re.I)
+                or re.search(r'(?<![\w/])10\.\d{4,9}/\S', re.sub(r'\([^()]*\)', '', text or '')))
+
+
+def residual_placeholders(root):
+    """域外残留的纯文字占位。返回 [{'para': i, 'text': str, 'kind': 'doi'|'bare'}]。
+
+    跨段深度感知：跨段域（BIBL 文献表）内的 https://doi.org/… 不会被误报。
+    """
+    out = []
+    for i, txt in outside_field_paragraphs(root):
+        if not txt or '10.' not in txt:
+            continue
+        if re.search(r'doi[:：]?\s*10\.\d{4,9}/', txt, re.I):
+            out.append({'para': i, 'text': txt[:120], 'kind': 'doi'})
+            continue
+        stripped = re.sub(r'\([^()]*\)', '', txt)
+        m = re.search(r'(?<![\w/])10\.\d{4,9}/\S', stripped)
+        if m:
+            out.append({'para': i, 'text': stripped[max(0, m.start() - 60):m.end() + 20],
+                        'kind': 'bare', 'doi': m.group(0)})
+    return out
+
+
+def document_item_keys(root):
+    """文档现有引文域引用的全部 itemKey（用于库内存在性校验 / 死链审计）。"""
+    keys = set()
+    for els, _, _ in collect_fields(root):
+        obj = field_payload(els)
+        if not obj or 'citationItems' not in obj:
+            continue
+        for ci in obj.get('citationItems', []):
+            for u in ci.get('uris', []):
+                keys.add(str(u).rsplit('/items/', 1)[-1])
+    return keys
+
+
+def citation_id_stats(root):
+    """citationID 统计：{'count','unique','duplicates':{id:n},'max_numeric'}。
+
+    撞号是真实的坑：Zotero 用 citationID 索引文档内引文对象，两条不同引文共用一个
+    ID 会让刷新把它们当成同一条。跨版本复制段落、手工合并文档都会造成编号世代重叠。
+    """
+    ids = []
+    for els, _, _ in collect_fields(root):
+        obj = field_payload(els)
+        if not obj or 'citationItems' not in obj:
+            continue
+        ids.append(obj.get('citationID'))
+    ids = [i for i in ids if i]
+    counts = {}
+    for i in ids:
+        counts[i] = counts.get(i, 0) + 1
+    dups = {k: v for k, v in counts.items() if v > 1}
+    mx = -1
+    for i in ids:
+        m = re.fullmatch(r'cit(\d+)', str(i))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return {'count': len(ids), 'unique': len(set(ids)), 'duplicates': dups,
+            'max_numeric': mx, 'ids': ids}
+
+
+def _citation_id_start(existing_ids, prefix='cit'):
+    """新域 citationID 起始计数 = 既有同前缀数字 ID 的最大值 + 1。
+
+    v1/v2 一律从 0 开始编号（cit0、cit1…），只要源文档已含引文域（无论来自本 skill
+    的历史转换，还是用户在 Word 里刷新过、或跨版本复制段落带来的编号世代重叠），
+    就必然撞号。这里让新域自动从安全起点编号。
+    """
+    mx = -1
+    for i in existing_ids or []:
+        m = re.fullmatch(re.escape(prefix) + r'(\d+)', str(i))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return mx + 1
+
+
 def _cell_has_citation(tc):
     """判断表格单元格（w:tc）是否已含引文域。同样拼接域内 instrText 以兼容 Word 拆分。"""
     in_f = False; cur = []
@@ -383,7 +575,7 @@ def _field_ranges(children):
     return ranges
 
 
-def _convert_runs(runs, finder, uri_prefix, item_mapping, iid, csl_for, cit_n):
+def _convert_runs(runs, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_start=0):
     """把一段连续 run 中的纯文字引文转换为域。finder(text)->spans。返回 (新 children, cit_n)。"""
     run_texts = [_run_text(r) for r in runs]
     T = ''.join(run_texts)
@@ -401,7 +593,7 @@ def _convert_runs(runs, finder, uri_prefix, item_mapping, iid, csl_for, cit_n):
         if s > cursor:
             new_children += _slice_runs(runs, run_texts, positions, cursor, s)
         rpr = _rpr_at(runs, positions, s)
-        cj = {"citationID": "cit" + str(cit_n),
+        cj = {"citationID": "cit" + str(cit_start + cit_n),
               "properties": {"formattedCitation": disp, "plainCitation": disp, "dontUpdate": False, "noteIndex": 0},
               "citationItems": [{"id": iid(k), "uris": [uri_prefix + item_mapping[k]['itemKey']],
                                  "itemData": csl_for(k)} for k in items],
@@ -414,7 +606,7 @@ def _convert_runs(runs, finder, uri_prefix, item_mapping, iid, csl_for, cit_n):
     return new_children, cit_n
 
 
-def _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n):
+def _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_start=0):
     """重建单个正文段落，支持同段混合：已有 Word/Zotero 域原样保留，只转换纯文字引文。
 
     hyperlink 与 pPr 等非 run 子元素原样保留（不转换超链接内的引文）。
@@ -431,7 +623,7 @@ def _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n):
         if not text_block:
             return
         converted, cit_n = _convert_runs(text_block, finder, uri_prefix,
-                                         item_mapping, iid, csl_for, cit_n)
+                                         item_mapping, iid, csl_for, cit_n, cit_start)
         new_children.extend(converted)
         text_block = []
 
@@ -517,7 +709,7 @@ def insert_zotero_fields(src_docx, out_docx, body_para_range, ref_para_indices,
         if not hit:
             return False
         k, disp = hit
-        cj = {"citationID": "cit" + str(cit_holder[0]),
+        cj = {"citationID": "cit" + str(cit_start + cit_holder[0]),
               "properties": {"formattedCitation": disp, "plainCitation": disp, "dontUpdate": False, "noteIndex": 0},
               "citationItems": [{"id": iid(k), "uris": [uri_prefix + item_mapping[k]['itemKey']],
                                  "itemData": csl_for(k)}],
@@ -534,12 +726,17 @@ def insert_zotero_fields(src_docx, out_docx, body_para_range, ref_para_indices,
         cit_holder[0] += 1
         return True
 
+    # v3：新域 citationID 自动避开文档中已存在的编号（否则跨版本/复制段落必撞号）。
+    # cit_start 只是编号偏移；cit_holder 仍从 0 计新增域数，函数返回值语义不变。
+    cit_start = _citation_id_start(
+        [obj.get('citationID') for els, _, _ in collect_fields(root) if (obj := field_payload(els))])
     cit_holder = [0]
 
     b0, b1 = body_para_range
     # 1) 正文引文域（支持同段混合：保留已有 Word/Zotero 域，只转换纯文字引文）
     for idx in range(b0, b1):
-        cit_holder[0] = _process_para(paras[idx], finder, uri_prefix, item_mapping, iid, csl_for, cit_holder[0])
+        cit_holder[0] = _process_para(paras[idx], finder, uri_prefix, item_mapping,
+                                     iid, csl_for, cit_holder[0], cit_start)
 
     # 1b) 表格内段落（可选）：独立 DOI 格整格替换；其余走同一段落转换
     if include_tables:
@@ -547,7 +744,8 @@ def insert_zotero_fields(src_docx, out_docx, body_para_range, ref_para_indices,
             for p in tbl.iter(W + 'p'):
                 if _standalone_cell(p):
                     continue
-                cit_holder[0] = _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_holder[0])
+                cit_holder[0] = _process_para(p, finder, uri_prefix, item_mapping,
+                                             iid, csl_for, cit_holder[0], cit_start)
 
     cit_n = cit_holder[0]
 
@@ -620,6 +818,10 @@ def insert_table_citations(src_docx, out_docx, item_mapping, doi_column, refnum_
         return item_ids[k]
     def csl_for(k):
         c = copy.deepcopy(item_mapping[k]['csl']); c['id'] = iid(k); c.pop('abstract', None); return c
+    # v3：与 insert_zotero_fields 同样自动避开既有 tcitN 编号（cit_n 仍是新增域数）
+    cit_start = _citation_id_start(
+        [obj.get('citationID') for els, _, _ in collect_fields(root) if (obj := field_payload(els))],
+        prefix='tcit')
     cit_n = 0
     target_col = refnum_column if refnum_column is not None else doi_column
     for ri in range(1, len(rows)):
@@ -637,7 +839,7 @@ def insert_table_citations(src_docx, out_docx, item_mapping, doi_column, refnum_
         # 该 Ref 单元格已含引文域则跳过（混合文档）
         if skip_existing and _cell_has_citation(ref_tc): continue
         runs = p.findall(W + 'r'); rpr = runs[0].find(W + 'rPr') if runs else None
-        cj = {"citationID": "tcit" + str(cit_n),
+        cj = {"citationID": "tcit" + str(cit_start + cit_n),
               "properties": {"formattedCitation": ref_text, "plainCitation": ref_text, "dontUpdate": False, "noteIndex": 0},
               "citationItems": [{"id": iid(key), "uris": [uri_prefix + item_mapping[key]['itemKey']],
                                  "itemData": csl_for(key)}], "schema": SCHEMA}
@@ -760,7 +962,8 @@ def _rtf_unescape(s):
     return _RTF_ESC.sub(_sub, s)
 
 
-def verify(out_docx, valid_item_keys, src_docx=None, item_mapping=None, citation_text_map=None):
+def verify(out_docx, valid_item_keys, src_docx=None, item_mapping=None,
+           citation_text_map=None, deep=False):
     """返回 (ok, 详情)。结构校验：fldChar 平衡、JSON 合法、URI 有效、CSL 完整。
 
     若同时给 src_docx 与 item_mapping，则额外做"引文零遗漏 + 显示文本逐字一致"比对：
@@ -768,20 +971,27 @@ def verify(out_docx, valid_item_keys, src_docx=None, item_mapping=None, citation
     引文，逐一核对是否都出现在输出域的显示文本里。citation_text_map 需与调用
     insert_zotero_fields 传的一致，否则 DOI/文本占位引用会被误报为漏掉。
     注意：一个域的指令可能被 Word 拆成多个 <w:instrText>，须把同一域内所有 instrText 拼接后再解析。
+
+    deep=True（v3 新增）再叠加三项交付前必须过的检查：
+      - citationID 唯一性（撞号会让 Zotero 刷新把两条引文当成同一条）
+      - 域外残留纯文字占位（跨段深度感知，不会被 BIBL 文献表里的 DOI 误报）
+      - 域计数明细（ITEM / BIBL / PREF）
+    这三项进 detail，且影响 ok。
     """
     z = zipfile.ZipFile(out_docx); root = etree.fromstring(z.read('word/document.xml'))
-    # 按 begin..end 切分域，拼接每个域内的所有 instrText
-    fields = []; in_f = False; cur = []
+    # 按 begin..end 切分域，拼接每个域内的所有 instrText（深度跨段连续传递）
+    fields = []; depth = 0; cur = None
     for r in root.iter(W + 'r'):
         for ch in r:
             tg = etree.QName(ch).localname
             if tg == 'fldChar':
                 ft = ch.get(W + 'fldCharType')
-                if ft == 'begin': in_f = True; cur = []
+                if ft == 'begin': depth += 1; cur = [] if depth == 1 else cur
                 elif ft == 'end':
-                    if cur: fields.append(''.join(cur))
-                    in_f = False; cur = []
-            elif tg == 'instrText' and in_f: cur.append(ch.text or '')
+                    if depth == 1 and cur is not None:
+                        fields.append(''.join(cur)); cur = None
+                    depth = max(0, depth - 1)
+            elif tg == 'instrText' and depth >= 1 and cur is not None: cur.append(ch.text or '')
     cites = bibs = prefs = 0; bad_json = bad_uri = incomplete = with_abstract = 0
     for t in fields:
         if 'ZOTERO_ITEM CSL_CITATION' in t:
@@ -810,6 +1020,12 @@ def verify(out_docx, valid_item_keys, src_docx=None, item_mapping=None, citation
         detail["missed_citations"] = missed
         detail["display_mismatches"] = mism
         ok = ok and not missed and not mism
+    if deep:
+        stats = citation_id_stats(root)
+        residual = residual_placeholders(root)
+        detail["citation_ids"] = {k: v for k, v in stats.items() if k != 'ids'}
+        detail["residual_placeholders"] = residual
+        ok = ok and not stats['duplicates'] and not residual
     return ok, detail
 
 
