@@ -1,0 +1,9 @@
+include README.md README.en.md LICENSE SKILL.md config.example.env requirements.txt pyproject.toml
+include __init__.py __main__.py config.py docx_audit.py docx_io.py doi_utils.py
+include reference_ingest.py zotero_field_insert.py zotero_mcp.py
+recursive-include tests *.py
+recursive-include scripts *.py
+recursive-include docs *.md
+global-exclude *.pyc
+exclude config.local.env .env
+recursive-include assets *.png

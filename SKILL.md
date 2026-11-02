@@ -3,10 +3,18 @@ name: 逆向zotero插入
 description: 当用户要求把参考文献以 Zotero 域代码格式插入/写入到 .docx 文件中（例如"插入 Zotero 格式文献""把引用转成 Zotero 域代码""让 Zotero 识别文档里的参考文献""用域代码替代纯文字参考文献"），或要求从纯文字的编号参考文献出发建库（例如"把参考文献插入 Zotero""从纯文本文献库入库""解析参考文献生成 Zotero 条目""给这份 docx 里的引用建 Zotero 库""resolve references and import to Zotero"），且无法直接操作 Word 的 Zotero 插件时，调用本 skill。端到端流程：扫描手稿全貌 → 联网解析纯文字编号参考文献的元数据 → 导入 Zotero（含强制用户检查点）→ 逆向 Zotero 域代码格式，直接在 docx 的 XML 中写入可被 Zotero 识别的引文域 / 参考文献表域 / 文档首选项域 → 逐组对账与交付前审计。
 ---
 
-# 逆向 Zotero 插入（Reverse Zotero Field-Code Insertion）· v3
+# 逆向 Zotero 插入（Reverse Zotero Field-Code Insertion）· v3.1
 
 ## 适用场景
 把一份 .docx 里的纯文字参考文献（正文引文占位 + 文末参考文献表）转换成 Zotero 能直接识别和管理的域代码（field code），但当前环境**无法驱动 Word 的 Zotero 插件 GUI**。本 skill 通过逆向 Zotero 的域代码格式直接编辑 docx 的 XML，效果与用 Zotero 插件插入一致：在 Word 里用 Zotero 打开时，引文和文献表都是"活的"、可刷新、已链接到库条目。
+
+## v3.1 调用约定
+
+- pip 安装后可用 `reverse-zotero-insert scan ...` 和 `from reverse_zotero_insert import ...`；源码调用保持兼容。
+- `import_to_zotero()` 返回 `(imported, warnings)`，构造 mapping 前先解包并检查 warnings。
+- MCP/查重请求失败会抛出异常，不能当作“库内无重复”。`apply_library_data()` 失败时保留原 mapping。
+- `audit` 命令发现对账异常返回退出码 1；参数/文件错误返回 2。
+- 已有测试为离线/模拟服务验证；最终 Word/Zotero 刷新效果需在目标桌面环境验证。
 
 ## v3 新增（相对 v2）
 
@@ -142,34 +150,57 @@ URI 形如 `http://zotero.org/users/<userID>/items/<itemKey>`。`userID` 与 API
 | `docx_audit.py` | **v3**：扫描、占位提取、表格列审计、逐组对账、重编号、重链接、CLI |
 | `zotero_mcp.py` | Zotero MCP 的 JSON-RPC 客户端 |
 | `config.py` | 个人标识（userID / API 端点 / 限流）读取，代码零硬编码 |
-| `tests/` | `python3 -m unittest discover -s tests`（v3 起 84 项） |
+| `tests/` | `python3 -m unittest discover -s tests`（包含 v3.1 回归用例） |
 
 ## 典型调用
 
 ```python
-import sys; sys.path.insert(0, '<skill目录>')
+import sys
+
+sys.path.insert(0, "<skill目录>")
 import docx_audit as da, zotero_field_insert as zfi, reference_ingest as ri
 
 # 第 0 步：扫描
 da.scan_document(src, verbose=True)
 
 # 库索引（失败必须上报）
-idx, failures, dups = ri.build_library_doi_index(['COLLECTION'], csl_builder=det_to_csl)
-doc_idx, dfail, ddup = ri.doc_item_dois(src, csl_builder=det_to_csl)   # 既有域引用的条目
-mapping = {f'ref_{d}': {'itemKey': e['itemKey'], 'uri': e['uri'], 'doi': e['doi'],
-                         'csl': e['csl'], 'first_author': ..., 'year': ...}
-           for d, e in {**idx, **doc_idx}.items()}
+idx, failures, dups = ri.build_library_doi_index(["COLLECTION"], csl_builder=det_to_csl)
+doc_idx, dfail, ddup = ri.doc_item_dois(src, csl_builder=det_to_csl)  # 既有域引用的条目
+mapping = {
+    f"ref_{d}": {
+        "itemKey": e["itemKey"],
+        "uri": e["uri"],
+        "doi": e["doi"],
+        "csl": e["csl"],
+        "first_author": ...,
+        "year": ...,
+    }
+    for d, e in {**idx, **doc_idx}.items()
+}
 
 # 插入（正文；citationID 自动避让既有编号）
 cit_n, bib_n = zfi.insert_zotero_fields(
-    src_docx=src, out_docx=out, body_para_range=(0, body_end), ref_para_indices=[],
-    item_mapping=mapping, style_id=style_id, style_locale='en-US',
-    skip_existing=True, include_tables=False)
+    src_docx=src,
+    out_docx=out,
+    body_para_range=(0, body_end),
+    ref_para_indices=[],
+    item_mapping=mapping,
+    style_id=style_id,
+    style_locale="en-US",
+    skip_existing=True,
+    include_tables=False,
+)
 
 # 插入（仅表格）
-zfi.insert_zotero_fields(src_docx=tbl, out_docx=tbl_out, body_para_range=(0, 0),
-                         ref_para_indices=[], item_mapping=mapping, style_id=style_id,
-                         include_tables=True)
+zfi.insert_zotero_fields(
+    src_docx=tbl,
+    out_docx=tbl_out,
+    body_para_range=(0, 0),
+    ref_para_indices=[],
+    item_mapping=mapping,
+    style_id=style_id,
+    include_tables=True,
+)
 
 # 交付前
 ok, detail = zfi.verify(out, valid_keys, src, mapping, deep=True)

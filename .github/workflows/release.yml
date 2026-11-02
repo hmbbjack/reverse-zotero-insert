@@ -1,0 +1,49 @@
+name: Build release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install ".[dev]"
+      - run: python -m unittest discover -s tests -v
+      - run: ruff check .
+      - run: ruff format --check .
+      - name: Validate version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from scripts.build_zip import version
+          with open('pyproject.toml', 'rb') as source:
+              package_version = tomllib.load(source)['project']['version']
+          assert version() == package_version == os.environ['RELEASE_TAG'].removeprefix('v')
+          PY
+      - run: python -m build
+      - run: python scripts/build_zip.py
+      - name: Verify installed release
+        run: |
+          python -m venv "$RUNNER_TEMP/release-test"
+          "$RUNNER_TEMP/release-test/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/release-test/bin/python" -I "$GITHUB_WORKSPACE/scripts/smoke_installed.py"
+      - name: Generate checksums
+        run: cd dist && sha256sum *.whl *.tar.gz *.zip > SHA256SUMS.txt
+      - name: Create reviewable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes --draft dist/*

@@ -11,6 +11,7 @@ Sources, in priority order:
      DB is present and readable.
   3. Placeholder "<YOUR_USER_ID>" with a warning.
 """
+
 import os
 import shutil
 import sqlite3
@@ -51,7 +52,8 @@ def _derive_user_id_from_sqlite():
     db = os.path.expanduser("~/Zotero/zotero.sqlite")
     if not os.path.exists(db):
         return None
-    tmp = tempfile.mktemp(suffix=".sqlite")
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
     try:
         shutil.copy2(db, tmp)
         conn = sqlite3.connect(tmp)
@@ -62,7 +64,7 @@ def _derive_user_id_from_sqlite():
         finally:
             conn.close()
         return str(row[0]) if row else None
-    except Exception:
+    except (OSError, sqlite3.Error):
         return None
     finally:
         try:

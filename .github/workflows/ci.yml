@@ -1,0 +1,44 @@
+name: Tests and packages
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install ".[dev]"
+      - run: python -m unittest discover -s tests -v
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m build
+      - run: python scripts/build_zip.py
+      - name: Test installed wheel outside the checkout
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/package-test"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PACKAGE_PY="$RUNNER_TEMP/package-test/Scripts/python.exe"
+          else
+            PACKAGE_PY="$RUNNER_TEMP/package-test/bin/python"
+          fi
+          "$PACKAGE_PY" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$PACKAGE_PY" -I "$GITHUB_WORKSPACE/scripts/smoke_installed.py"
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        with:
+          name: python-and-zip-packages
+          path: dist/*

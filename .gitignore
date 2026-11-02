@@ -10,3 +10,8 @@ doi_audit.json
 *.docx
 !tests/
 .DS_Store
+build/
+dist/
+*.egg-info/
+.venv/
+.ruff_cache/

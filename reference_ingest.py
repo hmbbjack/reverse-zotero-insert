@@ -18,6 +18,7 @@ zotero_mcp.call_tool（作为 zotero callable 传入，默认 zotero_mcp.call_to
   check_zotero_mcp -> extract_reference_paragraphs -> resolve_metadata
   -> dedup_check -> [强制检查点] -> import_to_zotero -> build_item_mapping
 """
+
 import json
 import html
 import re
@@ -26,10 +27,14 @@ import random
 import unicodedata
 from urllib.parse import quote
 
-try:
+if __package__:
+    from . import config
+    from .doi_utils import DOI_RE, normalize_doi
+    from .docx_io import load_root
+else:
     import config
-except Exception:
-    config = None
+    from doi_utils import DOI_RE, normalize_doi
+    from docx_io import load_root
 
 REF_KEY_MIN_CONFIDENCE = 0.6  # 低于此值标 LOW，需人工/Claude 复核
 
@@ -73,12 +78,12 @@ def _norm(s):
     if not s:
         return ""
     # 保留 CJK（中文文献），NFKD 折叠拉丁重音，去标点/空白
-    s = unicodedata.normalize('NFKD', s).lower()
-    return re.sub(r'[^a-z0-9一-鿿]', '', s)
+    s = unicodedata.normalize("NFKD", s).lower()
+    return re.sub(r"[^a-z0-9一-鿿]", "", s)
 
 
 def _is_cjk(s):
-    return any('一' <= ch <= '鿿' for ch in s)
+    return any("一" <= ch <= "鿿" for ch in s)
 
 
 def _title_words(s):
@@ -89,48 +94,51 @@ def _title_words(s):
     """
     if not s:
         return set()
-    t = unicodedata.normalize('NFKD', str(s)).lower()
-    words = set(re.findall(r'[a-z]+', t))
-    for run in re.findall(r'[一-鿿]+', t):
+    t = unicodedata.normalize("NFKD", str(s)).lower()
+    words = set(re.findall(r"[a-z]+", t))
+    for run in re.findall(r"[一-鿿]+", t):
         words.add(run)
         for i in range(len(run) - 1):
-            words.add(run[i:i + 2])
+            words.add(run[i : i + 2])
     return words
 
 
 def _first_author_lastname(csl):
-    au = csl.get('author') or []
+    au = csl.get("author") or []
     if au:
-        if au[0].get('family'):
-            return au[0]['family']
-        if au[0].get('literal'):
-            return au[0]['literal']
+        if au[0].get("family"):
+            return au[0]["family"]
+        if au[0].get("literal"):
+            return au[0]["literal"]
     return ""
 
 
 def _year(csl):
-    dp = csl.get('issued', {}).get('date-parts', [[None]])
+    dp = csl.get("issued", {}).get("date-parts", [[None]])
     if dp and dp[0] and dp[0][0]:
         return str(dp[0][0])
     return ""
 
 
 def _write_json(path, obj):
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
 def _get_zotero(zotero):
     if zotero is not None:
         return zotero
-    import zotero_mcp
+    if __package__:
+        from . import zotero_mcp
+    else:
+        import zotero_mcp
     return zotero_mcp.call_tool
 
 
 def _make_base_ref_key(surname, year):
     """生成 ref_key 基础段，如 'smith2007'；冲突后缀在 extract 层处理。"""
-    s = _norm(surname) or 'anon'
-    y = _norm(year) or 'nodate'
+    s = _norm(surname) or "anon"
+    y = _norm(year) or "nodate"
     return f"{s}{y}"
 
 
@@ -140,23 +148,31 @@ def check_zotero_mcp(zotero=None, url=None):
 
     未就绪时，SKILL/claude 应据此提醒用户"Zotero MCP 未配置好"并给出修复方式。
     """
+    if url is not None and zotero is None:
+        if __package__:
+            from .zotero_mcp import MCPClient
+        else:
+            from zotero_mcp import MCPClient
+        zotero = MCPClient(url=url).call_tool
     zotero = _get_zotero(zotero)
-    # 用 get_collections 探测更稳妥（部分 MCP 实现无 get_libraries）；get_libraries 失败则回退
-    try:
-        res = zotero("get_libraries", {})
-    except Exception:
+    errors = []
+    for tool in ("get_libraries", "get_collections"):
         try:
-            res = zotero("get_collections", {})
-        except Exception as e:  # 连接失败 / 超时
-            return {"ok": False, "configured": False, "error": str(e),
-                    "hint": "无法连接 Zotero MCP。请确认：① Zotero 正在运行且已启用 MCP 连接器"
-                            "（replication 插件/连接器监听 127.0.0.1:23120）；"
-                            "② 或设置 ZOTERO_MCP_URL 环境变量指向你的 MCP 服务。"}
-    if isinstance(res, dict) and res.get("error"):
-        return {"ok": False, "configured": False, "error": res["error"],
-                "hint": "Zotero MCP 返回错误。请确认连接器已启用、Zotero 正在运行，"
-                        "或设置 ZOTERO_MCP_URL。"}
-    return {"ok": True, "configured": True, "detail": res}
+            result = zotero(tool, {})
+            if not isinstance(result, (dict, list)):
+                raise RuntimeError("Unrecognized MCP response")
+            if isinstance(result, dict) and (result.get("error") or result.get("isError")):
+                raise RuntimeError(str(result))
+            return {"ok": True, "configured": True, "detail": result}
+        except Exception as error:
+            errors.append(f"{tool}: {error}")
+    return {
+        "ok": False,
+        "configured": False,
+        "error": "; ".join(errors),
+        "hint": "无法连接 Zotero MCP。请启动 Zotero 并启用 cookjohn/zotero-mcp 插件，"
+        "或设置 ZOTERO_MCP_URL 指向可达的 MCP 服务。",
+    }
 
 
 # ---------- docx 解析 ----------
@@ -165,7 +181,7 @@ def _detect_ref_paras(paras):
 
     返回连续编号段；允许编号段之间夹空段（容忍个别空行），但遇到非空、非编号段则停止。
     """
-    pat = re.compile(r'^\s*(?:\[[0-9]+\]|\([0-9]+\)|[0-9]+[\.\)]\s?)')
+    pat = re.compile(r"^\s*(?:\[[0-9]+\]|\([0-9]+\)|[0-9]+[\.\)]\s?)")
     idx = [i for i, p in enumerate(paras) if pat.match(p.text or "")]
     if not idx:
         return []
@@ -187,6 +203,7 @@ def extract_reference_paragraphs(docx_path, ref_para_indices=None, auto_detect=T
     ref_key 如 'smith2007'，作者+年份冲突时加 _2/_3。
     """
     from docx import Document
+
     doc = Document(docx_path)
     paras = doc.paragraphs
     if ref_para_indices is None:
@@ -219,22 +236,22 @@ def parse_numbered_reference(text):
     raw = (text or "").strip()
     if not raw:
         return None
-    t = re.sub(r'^[\(\[\{]?\s*\d+\s*[\)\.\}\]]?\s*', '', raw)  # 去掉前导编号
-    year_m = re.search(r'\b(19|20)\d{2}\b', t)
+    t = re.sub(r"^[\(\[\{]?\s*\d+\s*[\)\.\}\]]?\s*", "", raw)  # 去掉前导编号
+    year_m = re.search(r"\b(19|20)\d{2}\b", t)
     year = year_m.group(0) if year_m else None
-    doi_m = re.search(r'(?:doi[:/]\s*)?(10\.\d{4,}/[^\s;,)]+)', t, re.I)
-    doi = doi_m.group(1).rstrip('.,') if doi_m else None
-    pmid_m = re.search(r'PMID[:#]?\s*(\d+)', t, re.I)
+    doi_m = DOI_RE.search(t)
+    doi = normalize_doi(doi_m.group(1)) if doi_m else None
+    pmid_m = re.search(r"PMID[:#]?\s*(\d+)", t, re.I)
     pmid = pmid_m.group(1) if pmid_m else None
 
-    clauses = [c for c in re.split(r'\.\s+', t) if c.strip()]
+    clauses = [c for c in re.split(r"\.\s+", t) if c.strip()]
 
     def _pick_journal():
         """从作者/标题之后的从句里挑期刊：跳过纯 DOI/PMID 段与年份段。"""
         for cl in reversed(clauses[1:]):
-            if re.match(r'^(?:doi[:/]|pmid[:#]?\s*\d)', cl, re.I):
+            if re.match(r"^(?:doi[:/]|pmid[:#]?\s*\d)", cl, re.I):
                 continue
-            if re.match(r'^\s*(?:19|20)\d{2}\b', cl):
+            if re.match(r"^\s*(?:19|20)\d{2}\b", cl):
                 continue
             return cl
         return None
@@ -248,25 +265,26 @@ def parse_numbered_reference(text):
         # 或短从句（≤3 词）以单/多字母首字母结尾（"Smith JD" / "Smith J"）。
         # 或为 2-4 字中文人名（"张三"）。
         # 避免把 "A study of treatment outcomes" / "Risk factors for Y" 这类标题误判为作者。
-        n_sep = first.count(',') + first.count(';')
-        has_and = bool(re.search(r'\s+(?:and|&)\s+', first))
+        n_sep = first.count(",") + first.count(";")
+        has_and = bool(re.search(r"\s+(?:and|&)\s+", first))
         n_tok = len(first.split())
-        has_initials = (n_sep > 0 or has_and
-                        or (n_tok <= 3 and re.search(r'\s+[A-Z][A-Z.]{0,2}[.,]?$', first)))
-        has_cjk_author = bool(re.fullmatch(r'[一-鿿]{2,4}', first))
-        has_year = bool(re.search(r'\b(19|20)\d{2}\b', first))
+        has_initials = (
+            n_sep > 0 or has_and or (n_tok <= 3 and re.search(r"\s+[A-Z][A-Z.]{0,2}[.,]?$", first))
+        )
+        has_cjk_author = bool(re.fullmatch(r"[一-鿿]{2,4}", first))
+        has_year = bool(re.search(r"\b(19|20)\d{2}\b", first))
         if (has_initials or has_cjk_author) and not has_year:
             # 首段是作者部分："Smith J, Johnson K" / "Smith JD" / "张三"
-            for part in re.split(r'\s*[;,]\s*|\s+and\s+', first):
+            for part in re.split(r"\s*[;,]\s*|\s+and\s+", first):
                 part = part.strip()
                 if not part:
                     continue
-                if re.fullmatch(r'(?:et\s*al)\.?', part, re.I):
+                if re.fullmatch(r"(?:et\s*al)\.?", part, re.I):
                     continue  # 跳过 "et al"，不是作者
-                m = re.match(r'^(.+?)\s+([A-ZÀ-Ý][A-ZÀ-Ý.]*(?:\s+[A-ZÀ-Ý][A-ZÀ-Ý.]*)*)$', part)
+                m = re.match(r"^(.+?)\s+([A-ZÀ-Ý][A-ZÀ-Ý.]*(?:\s+[A-ZÀ-Ý][A-ZÀ-Ý.]*)*)$", part)
                 if m:
                     family = m.group(1).strip()
-                    given = m.group(2).strip().rstrip('.,')
+                    given = m.group(2).strip().rstrip(".,")
                     authors.append({"family": family, "given": given})
                 elif _is_cjk(part):
                     # 中文人名整体作为姓（查询用；真正匹配由 CSL 的 family 驱动）
@@ -312,13 +330,14 @@ def build_query(parsed_ref):
 
 def _http_get_json(url, params=None, headers=None):
     import requests
+
     r = requests.get(url, params=params, headers=headers or {}, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def _backoff(attempt, base=1.2):
-    time.sleep(base * (2 ** attempt) + random.uniform(0, 0.5))
+    time.sleep(base * (2**attempt) + random.uniform(0, 0.5))
 
 
 _last_req = {}
@@ -361,7 +380,9 @@ def search_crossref_by_doi(doi):
     params = {"mailto": mailto} if mailto else None
     headers = {"User-Agent": f"zotero-reverse-ingest/1.0 (mailto:{mailto or 'anonymous'})"}
     try:
-        data = _http_get_json(f"https://api.crossref.org/works/{quote(doi, safe='')}", params, headers)
+        data = _http_get_json(
+            f"https://api.crossref.org/works/{quote(doi, safe='')}", params, headers
+        )
         msg = data.get("message")
         return [msg] if msg else []
     except Exception:
@@ -395,15 +416,23 @@ def search_pubmed(query, rows=5):
                 if nm:
                     parts = nm.split()
                     authors.append({"family": parts[-1], "given": " ".join(parts[:-1])})
-            items.append({
-                "pmid": pid,
-                "title": "".join(d.get("title", "")),
-                "source": d.get("source", ""),
-                "pubdate": d.get("pubdate", ""),
-                "authors": authors,
-                "doi": next((x.get("value", "") for x in d.get("articleids", [])
-                             if x.get("idtype") == "doi"), ""),
-            })
+            items.append(
+                {
+                    "pmid": pid,
+                    "title": "".join(d.get("title", "")),
+                    "source": d.get("source", ""),
+                    "pubdate": d.get("pubdate", ""),
+                    "authors": authors,
+                    "doi": next(
+                        (
+                            x.get("value", "")
+                            for x in d.get("articleids", [])
+                            if x.get("idtype") == "doi"
+                        ),
+                        "",
+                    ),
+                }
+            )
         return items
     except Exception:
         return []
@@ -411,10 +440,18 @@ def search_pubmed(query, rows=5):
 
 # ---------- CSL 构建 + 置信度 ----------
 def _map_type(t):
-    m = {"journal-article": "article-journal", "journal-issue": "article-journal",
-         "book-chapter": "chapter", "book": "book", "proceedings-article": "paper-conference",
-         "report": "report", "dissertation": "thesis", "posted-content": "article-journal",
-         "webpage": "webpage", "dataset": "dataset"}
+    m = {
+        "journal-article": "article-journal",
+        "journal-issue": "article-journal",
+        "book-chapter": "chapter",
+        "book": "book",
+        "proceedings-article": "paper-conference",
+        "report": "report",
+        "dissertation": "thesis",
+        "posted-content": "article-journal",
+        "webpage": "webpage",
+        "dataset": "dataset",
+    }
     return m.get(t, "article-journal")
 
 
@@ -423,9 +460,9 @@ def _clean_crossref_text(s):
     不清理会把标记原样写进 Zotero 标题（如 "Late <i>N</i>-acetylcysteine…"）。"""
     if not s:
         return s
-    s = re.sub(r'<[^>]+>', '', str(s))
+    s = re.sub(r"<[^>]+>", "", str(s))
     s = html.unescape(s)
-    return re.sub(r'\s+', ' ', s).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def crossref_to_csl(item):
@@ -464,7 +501,7 @@ def pubmed_to_csl(it):
         csl["author"] = it["authors"]
     if it.get("source"):
         csl["container-title"] = it["source"]
-    ym = re.search(r'\b(19|20)\d{2}\b', it.get("pubdate", ""))
+    ym = re.search(r"\b(19|20)\d{2}\b", it.get("pubdate", ""))
     if ym:
         csl["issued"] = {"date-parts": [[int(ym.group(0))]]}
     if it.get("doi"):
@@ -508,7 +545,7 @@ def resolve_metadata(refs, providers=("crossref", "pubmed")):
     置信度不足再走 PubMed 兜底。
     """
     resolved = {}
-    for (_idx, key, raw) in refs:
+    for _idx, key, raw in refs:
         parsed = parse_numbered_reference(raw)
         candidates = []
         best = None
@@ -527,8 +564,15 @@ def resolve_metadata(refs, providers=("crossref", "pubmed")):
                 sc, matched = confidence_score(csl, parsed)
                 if it.get("DOI") and _norm(parsed["doi"]) == _norm(it["DOI"]):
                     sc, matched = 1.0, list(set(matched) | {"doi"})
-                consider({"csl": csl, "provider": "crossref", "doi": it.get("DOI"),
-                          "confidence": sc, "matched": matched})
+                consider(
+                    {
+                        "csl": csl,
+                        "provider": "crossref",
+                        "doi": it.get("DOI"),
+                        "confidence": sc,
+                        "matched": matched,
+                    }
+                )
         # 2) 置信度不足或无 DOI 命中，转模糊搜索
         if best is None or best_score < REF_KEY_MIN_CONFIDENCE:
             _prov, q = build_query(parsed)
@@ -536,8 +580,15 @@ def resolve_metadata(refs, providers=("crossref", "pubmed")):
                 for it in search_crossref(q):
                     csl = crossref_to_csl(it)
                     sc, matched = confidence_score(csl, parsed)
-                    consider({"csl": csl, "provider": "crossref", "doi": it.get("DOI"),
-                              "confidence": sc, "matched": matched})
+                    consider(
+                        {
+                            "csl": csl,
+                            "provider": "crossref",
+                            "doi": it.get("DOI"),
+                            "confidence": sc,
+                            "matched": matched,
+                        }
+                    )
         # 3) CrossRef 仍不足，走 PubMed 兜底
         if (best is None or best_score < REF_KEY_MIN_CONFIDENCE) and "pubmed" in providers:
             _prov, q = build_query(parsed)
@@ -545,8 +596,15 @@ def resolve_metadata(refs, providers=("crossref", "pubmed")):
                 for it in search_pubmed(q):
                     csl = pubmed_to_csl(it)
                     sc, matched = confidence_score(csl, parsed)
-                    consider({"csl": csl, "provider": "pubmed", "pmid": it.get("pmid"),
-                              "confidence": sc, "matched": matched})
+                    consider(
+                        {
+                            "csl": csl,
+                            "provider": "pubmed",
+                            "pmid": it.get("pmid"),
+                            "confidence": sc,
+                            "matched": matched,
+                        }
+                    )
         resolved[key] = {
             "csl": best["csl"] if best else {},
             "provider": best["provider"] if best else None,
@@ -560,14 +618,18 @@ def resolve_metadata(refs, providers=("crossref", "pubmed")):
 
 
 def _summarize(resolved):
-    return {k: {"title": v["csl"].get("title", ""),
-                "first_author": _first_author_lastname(v["csl"]),
-                "year": _year(v["csl"]),
-                "provider": v["provider"],
-                "confidence": v["confidence"],
-                "level": _confidence_level(v["confidence"]),
-                "resolve_error": v.get("resolve_error", False)}
-            for k, v in resolved.items()}
+    return {
+        k: {
+            "title": v["csl"].get("title", ""),
+            "first_author": _first_author_lastname(v["csl"]),
+            "year": _year(v["csl"]),
+            "provider": v["provider"],
+            "confidence": v["confidence"],
+            "level": _confidence_level(v["confidence"]),
+            "resolve_error": v.get("resolve_error", False),
+        }
+        for k, v in resolved.items()
+    }
 
 
 def _confidence_level(score):
@@ -595,11 +657,15 @@ def _results(res):
     """
     if isinstance(res, list):
         return res
+    if isinstance(res, dict) and (res.get("error") or res.get("isError")):
+        raise RuntimeError(f"Zotero query failed: {res}")
     if isinstance(res, dict):
         for k in ("results", "items", "data"):
             if isinstance(res.get(k), list):
                 return res[k]
-    return []
+    if res == {}:
+        return []
+    raise RuntimeError(f"Unrecognized Zotero list response: {type(res).__name__}")
 
 
 def _search_results(zotero, q, mode="standard", limit=5):
@@ -618,34 +684,13 @@ def _doi_search(zotero, doi):
         key = it.get("key")
         if not key:
             continue
-        try:
-            det = zotero("get_item_details", {"itemKey": key, "mode": "complete"})
-        except Exception:
-            continue
-        if isinstance(det, dict) and key == det.get("key", key) and \
-                normalize_doi(det.get("DOI")) == normalize_doi(doi):
+        det = zotero("get_item_details", {"itemKey": key, "mode": "complete"})
+        if not isinstance(det, dict) or det.get("error") or det.get("isError"):
+            raise RuntimeError(f"Unable to verify existing Zotero item {key}: {det}")
+        if key == det.get("key", key) and normalize_doi(det.get("DOI")) == normalize_doi(doi):
             det["key"] = key
             hits.append(det)
     return hits
-
-
-def normalize_doi(doi):
-    """DOI 归一化：去前缀、去尾随标点、转小写。老式括号 DOI（(98)00014-6）原样保留。
-
-    手稿里的 DOI 写法五花八门：`https://doi.org/10.x`、`doi:10.x`、`10.x.`、
-    `(doi:10.x; 10.y)` 的分片、`10.1016/S0306-4530(98)00014-6`。
-    直接用原串查库必然漏命中。所有比对路径都应先过这个函数。
-    """
-    if not doi:
-        return ""
-    s = str(doi).strip()
-    s = re.sub(r'^[\s(（]+', '', s)                       # 前导分组括号
-    s = re.sub(r'^(?:https?://(?:dx\.)?doi\.org/|doi\s*[:：]\s*)', '', s, flags=re.I)
-    s = s.strip().rstrip('.,;')
-    # 尾部括号属于分组而非 DOI；老式 DOI 自身以 (98) 结尾的年份段要保留
-    while s and s[-1] in ')）' and not re.search(r'\(\d{2}[A-Za-z0-9]?\)$', s):
-        s = s[:-1].rstrip()
-    return s.lower()
 
 
 def _collection_item_keys(zotero, collection_key):
@@ -653,8 +698,9 @@ def _collection_item_keys(zotero, collection_key):
     return [it.get("key") for it in _results(res) if it.get("key")]
 
 
-def build_library_doi_index(collection_keys=None, item_keys=None, zotero=None,
-                            progress_every=0, csl_builder=None):
+def build_library_doi_index(
+    collection_keys=None, item_keys=None, zotero=None, progress_every=0, csl_builder=None
+):
     """把 Zotero 库（指定文件夹 / 指定 key 集合）建成 {归一化DOI: {itemKey, uri, title, csl}}。
 
     **绝不静默跳过失败**：get_item_details 对已删除条目会返回 {'error': ...}，
@@ -668,7 +714,7 @@ def build_library_doi_index(collection_keys=None, item_keys=None, zotero=None,
     zotero = _get_zotero(zotero)
     if item_keys is None:
         keys = []
-        for ck in (collection_keys or []):
+        for ck in collection_keys or []:
             keys.extend(_collection_item_keys(zotero, ck))
         item_keys = sorted(set(keys))
     index, failures, dups = {}, [], {}
@@ -689,7 +735,7 @@ def build_library_doi_index(collection_keys=None, item_keys=None, zotero=None,
             continue
         index[d] = {
             "itemKey": k,
-            "uri": f"http://zotero.org/users/{_zotero_user_id()}/items/{k}",
+            "uri": config.get_uri_prefix() + k,
             "doi": det.get("DOI") or d,
             "title": det.get("title", ""),
             "csl": csl_builder(det) if csl_builder else {},
@@ -698,13 +744,6 @@ def build_library_doi_index(collection_keys=None, item_keys=None, zotero=None,
         if progress_every and i % progress_every == 0:
             print(f"  …{i}/{len(item_keys)}", flush=True)
     return index, failures, dups
-
-
-def _zotero_user_id():
-    try:
-        return config.get_user_id()
-    except Exception:
-        return "local"
 
 
 def verify_item_keys(keys, zotero=None, progress_every=0):
@@ -720,11 +759,16 @@ def verify_item_keys(keys, zotero=None, progress_every=0):
     for i, k in enumerate(keys, 1):
         try:
             det = zotero("get_item_details", {"itemKey": k, "mode": "minimal"})
-            bad = (not isinstance(det, dict) or det.get("error")
-                   or not det.get("title"))
+            bad = not isinstance(det, dict) or det.get("error") or not det.get("title")
         except Exception as e:
             bad, det = True, {"error": str(e)[:80]}
-        (missing.append((k, str(det.get('error'))[:100])) if bad else ok.append(k))
+        if bad:
+            error = (
+                det.get("error", "missing item title") if isinstance(det, dict) else "bad response"
+            )
+            missing.append((k, str(error)[:100]))
+        else:
+            ok.append(k)
         if progress_every and i % progress_every == 0:
             print(f"  …{i}/{len(keys)}", flush=True)
     return ok, missing
@@ -737,40 +781,12 @@ def doc_item_dois(docx_path, zotero=None, csl_builder=None):
     **占位 DOI ∪ 既有域引用** 的并集：只被既有域引用的文献不在占位集合里，
     少了它们，校验会把合法既有域误判为映射外。
     """
-    try:
-        import docx_audit
-    except ImportError:
-        docx_audit = None
-    import zipfile as _zipfile
-    from lxml import etree as _etree
-    if docx_audit is not None:
-        root = docx_audit.etree.fromstring(
-            _zipfile.ZipFile(docx_path).read('word/document.xml'))
-        keys = docx_audit.zfi.document_item_keys(root)
+    if __package__:
+        from .zotero_field_insert import document_item_keys
     else:
         from zotero_field_insert import document_item_keys
-        root = _etree.fromstring(_zipfile.ZipFile(docx_path).read('word/document.xml'))
-        keys = document_item_keys(root)
-    idx, failures, dups = {}, [], {}
-    zotero = _get_zotero(zotero)
-    for k in sorted(keys):
-        try:
-            det = zotero("get_item_details", {"itemKey": k, "mode": "complete"})
-        except Exception as e:
-            failures.append((k, f"{type(e).__name__}: {e}"))
-            continue
-        if not isinstance(det, dict) or det.get("error") or not det.get("title"):
-            failures.append((k, "not found"))
-            continue
-        d = normalize_doi(det.get("DOI") or "")
-        if not d:
-            continue
-        idx[d] = {"itemKey": k,
-                  "uri": f"http://zotero.org/users/{_zotero_user_id()}/items/{k}",
-                  "doi": det.get("DOI") or d,
-                  "title": det.get("title", ""),
-                  "csl": csl_builder(det) if csl_builder else {}}
-    return idx, failures, dups
+    keys = document_item_keys(load_root(docx_path))
+    return build_library_doi_index(item_keys=sorted(keys), zotero=zotero, csl_builder=csl_builder)
 
 
 def dedup_check(resolved, collection_key=None, zotero=None):
@@ -831,8 +847,7 @@ def audit_imported_by_doi(resolved, zotero=None):
 def _existing_meta(it):
     prefix = config.get_uri_prefix() if config else ""
     key = it.get("key")
-    return {"key": key, "title": it.get("title", ""),
-            "uri": (prefix + key) if key else ""}
+    return {"key": key, "title": it.get("title", ""), "uri": (prefix + key) if key else ""}
 
 
 # ---------- 导入（给定用户选定的 collection key） ----------
@@ -843,7 +858,9 @@ def _csl_to_field_map(csl):
         fields["title"] = csl["title"]
     if csl.get("container-title"):
         # 章节：书名放 bookTitle（Zotero bookSection 字段），期刊放 publicationTitle
-        fields["bookTitle" if itemType == "bookSection" else "publicationTitle"] = csl["container-title"]
+        fields["bookTitle" if itemType == "bookSection" else "publicationTitle"] = csl[
+            "container-title"
+        ]
     if csl.get("volume"):
         fields["volume"] = str(csl["volume"])
     if csl.get("issue"):
@@ -880,16 +897,28 @@ def _csl_to_creators(csl):
         if a.get("literal"):
             out.append({"creatorType": "author", "name": a["literal"]})
         else:
-            out.append({"creatorType": "author",
-                        "firstName": a.get("given", ""),
-                        "lastName": a.get("family", "")})
+            out.append(
+                {
+                    "creatorType": "author",
+                    "firstName": a.get("given", ""),
+                    "lastName": a.get("family", ""),
+                }
+            )
     return out
 
 
 def _csl_to_itemtype(csl):
-    m = {"article-journal": "journalArticle", "chapter": "bookSection", "book": "book",
-         "paper-conference": "conferencePaper", "report": "report", "thesis": "thesis",
-         "webpage": "webpage", "dataset": "dataset", "posted-content": "preprint"}
+    m = {
+        "article-journal": "journalArticle",
+        "chapter": "bookSection",
+        "book": "book",
+        "paper-conference": "conferencePaper",
+        "report": "report",
+        "thesis": "thesis",
+        "webpage": "webpage",
+        "dataset": "dataset",
+        "posted-content": "preprint",
+    }
     return m.get(csl.get("type"), "journalArticle")
 
 
@@ -906,9 +935,9 @@ def _extract_item_key(res):
         return None
     if isinstance(res, str):
         s = res.strip()
-        if re.fullmatch(r'[0-9A-Za-z]{8}', s):
+        if re.fullmatch(r"[0-9A-Za-z]{8}", s):
             return s
-        m = re.search(r'\b([0-9A-Za-z]{8})\b', s)
+        m = re.search(r"\b([0-9A-Za-z]{8})\b", s)
         return m.group(1) if m else None
     if isinstance(res, dict):
         if res.get("key") and len(str(res["key"])) <= 16:
@@ -955,6 +984,10 @@ def import_to_zotero(import_plan, collection_key, zotero=None, uri_prefix=None, 
     返回 (imported, warnings)。imported = {ref_key: {itemKey, uri, csl}}；
     warnings 列出 write_item 后未能提取到 key 的条目（避免静默丢失）。
     """
+    for key, plan in import_plan.items():
+        action = plan.get("action", "import")
+        if action not in {"import", "reuse", "skip"}:
+            raise ValueError(f"{key}: unknown import action {action!r}")
     zotero = _get_zotero(zotero)
     if uri_prefix is None:
         uri_prefix = config.get_uri_prefix() if config else ""
@@ -979,8 +1012,12 @@ def import_to_zotero(import_plan, collection_key, zotero=None, uri_prefix=None, 
             zk = _find_existing_item(csl, zotero)
             if zk:
                 items_to_add.append(zk)
-                imported[key] = {"itemKey": zk, "uri": uri_prefix + zk, "csl": csl,
-                                 "precheck_reused": True}
+                imported[key] = {
+                    "itemKey": zk,
+                    "uri": uri_prefix + zk,
+                    "csl": csl,
+                    "precheck_reused": True,
+                }
                 continue
         args = {
             "action": "create",
@@ -1000,15 +1037,17 @@ def import_to_zotero(import_plan, collection_key, zotero=None, uri_prefix=None, 
         else:
             warnings.append(f"{key}: write_item 未返回可用的 item key（响应: {_safe_str(res)}）")
     if items_to_add and collection_key:
-        zotero("add_items_to_collection", {
-            "collectionKey": collection_key, "itemKeys": items_to_add})
+        zotero(
+            "add_items_to_collection",
+            {"collectionKey": collection_key, "itemKeys": list(dict.fromkeys(items_to_add))},
+        )
     return imported, warnings
 
 
 def _safe_str(res):
     try:
         return json.dumps(res, ensure_ascii=False)[:200]
-    except Exception:
+    except (TypeError, ValueError):
         return str(res)[:200]
 
 
@@ -1035,7 +1074,7 @@ def _parse_lib_date(d):
     """库内 date 形如 "2008" / "2023-01" / "2026-05-13" -> date-parts 列表。"""
     if not d:
         return None
-    m = re.match(r'^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?', str(d).strip())
+    m = re.match(r"^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", str(d).strip())
     if not m:
         return None
     parts = [int(m.group(1))]
@@ -1069,8 +1108,12 @@ def _lib_details_to_csl(det, fallback_type="article-journal"):
     dp = _parse_lib_date(det.get("date"))
     csl["issued"] = {"date-parts": [dp]} if dp else {"date-parts": [[]]}
     if csl["type"] != "report":
-        for src, dst in (("publicationTitle", "container-title"), ("volume", "volume"),
-                         ("issue", "issue"), ("pages", "page")):
+        for src, dst in (
+            ("publicationTitle", "container-title"),
+            ("volume", "volume"),
+            ("issue", "issue"),
+            ("pages", "page"),
+        ):
             if det.get(src):
                 csl[dst] = det[src]
     if det.get("DOI"):
@@ -1090,31 +1133,43 @@ def apply_library_data(item_mapping, zotero=None, update_doi_field=False):
     （mapping 的 doi 锚点保持不变，只用于正文匹配）。"""
     zotero = _get_zotero(zotero)
     mismatches = []
-    for ref_key, v in item_mapping.items():
-        zk = v.get("itemKey")
-        if not zk:
-            continue
-        try:
-            det = zotero("get_item_details", {"itemKey": zk, "mode": "complete"})
-        except Exception:
-            continue
-        if not isinstance(det, dict) or not det.get("title"):
-            continue
-        lib_doi = str(det.get("DOI", "")).strip()
-        map_doi = str(v.get("doi", "")).strip()
-        if lib_doi and map_doi and lib_doi.lower() != map_doi.lower():
+    updates = {}
+    for ref_key, value in item_mapping.items():
+        key = value.get("itemKey")
+        if not key:
+            raise ValueError(f"{ref_key}: missing itemKey")
+        detail = zotero("get_item_details", {"itemKey": key, "mode": "complete"})
+        if not isinstance(detail, dict) or detail.get("error") or not detail.get("title"):
+            raise RuntimeError(f"Unable to read library item {key}: {detail}")
+        lib_doi = str(detail.get("DOI") or "").strip()
+        map_doi = str(value.get("doi") or "").strip()
+        if lib_doi and map_doi and normalize_doi(lib_doi) != normalize_doi(map_doi):
             mismatches.append((ref_key, map_doi, lib_doi))
-        v["csl"] = _lib_details_to_csl(det, fallback_type=v.get("csl", {}).get("type", "article-journal"))
-        v["first_author"] = _first_author_lastname(v["csl"]) or v.get("first_author", "")
-        v["year"] = _year(v["csl"]) or v.get("year", "")
+        csl = _lib_details_to_csl(
+            detail, fallback_type=value.get("csl", {}).get("type", "article-journal")
+        )
+        updates[ref_key] = {
+            "csl": csl,
+            "first_author": _first_author_lastname(csl) or value.get("first_author", ""),
+            "year": _year(csl) or value.get("year", ""),
+        }
         if update_doi_field and lib_doi:
-            v["doi"] = lib_doi
+            updates[ref_key]["doi"] = lib_doi
+    # Do not leave a half-updated mapping if a later library request fails.
+    for ref_key, update in updates.items():
+        item_mapping[ref_key].update(update)
     return item_mapping, mismatches
 
 
 # ---------- 非交互兜底编排 ----------
-def ingest(docx_path, collection_key, out="item_mapping.json", ref_para_indices=None,
-           zotero=None, uri_prefix=None):
+def ingest(
+    docx_path,
+    collection_key,
+    out="item_mapping.json",
+    ref_para_indices=None,
+    zotero=None,
+    uri_prefix=None,
+):
     """parse -> resolve -> dedup -> [无检查点] -> import -> mapping。
 
     注意：这是非交互捷径，会直接导入。交互 skill 流程应由 Claude 分步调用，
@@ -1126,20 +1181,29 @@ def ingest(docx_path, collection_key, out="item_mapping.json", ref_para_indices=
         return {"error": mcp.get("hint")}
     refs = extract_reference_paragraphs(docx_path, ref_para_indices)
     if not refs:
-        return {"error": "未在文档中解析到编号参考文献。请确认 ref_para_indices 或编号格式（[n]/(n)/n./n)）。"}
+        return {
+            "error": "未在文档中解析到编号参考文献。请确认 ref_para_indices 或编号格式（[n]/(n)/n./n)）。"
+        }
     resolved = resolve_metadata(refs)
     if not any(v.get("csl") for v in resolved.values()):
-        return {"error": "全部参考文献均未解析出元数据（联网失败或格式异常）。请检查网络/Crossref/PubMed 可达性。"}
+        return {
+            "error": "全部参考文献均未解析出元数据（联网失败或格式异常）。请检查网络/Crossref/PubMed 可达性。"
+        }
     dup = dedup_check(resolved, collection_key=collection_key, zotero=zotero)
-    import_plan = {k: {"action": "import", "csl": v["csl"]}
-                   for k, v in resolved.items() if v.get("csl")}
-    imported, warnings_ = import_to_zotero(import_plan, collection_key, zotero=zotero, uri_prefix=uri_prefix)
+    import_plan = {
+        k: {"action": "import", "csl": v["csl"]} for k, v in resolved.items() if v.get("csl")
+    }
+    imported, warnings_ = import_to_zotero(
+        import_plan, collection_key, zotero=zotero, uri_prefix=uri_prefix
+    )
     mapping = build_item_mapping(imported, uri_prefix=uri_prefix)
     _write_json(out, mapping)
     stats = {
         "total": len(resolved),
         "resolved": sum(1 for v in resolved.values() if v.get("csl")),
-        "low_confidence": sum(1 for v in resolved.values() if v["confidence"] < REF_KEY_MIN_CONFIDENCE),
+        "low_confidence": sum(
+            1 for v in resolved.values() if v["confidence"] < REF_KEY_MIN_CONFIDENCE
+        ),
         "dups": sum(1 for v in dup.values() if v["status"] != "none"),
         "imported": len(imported),
         "skipped": len(resolved) - len(imported),

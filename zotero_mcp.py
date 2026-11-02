@@ -1,112 +1,170 @@
 #!/usr/bin/env python3
-"""Helper to call Zotero MCP server via Streamable HTTP."""
-import json, sys, urllib.request
+"""Streamable HTTP MCP client with explicit transport and protocol errors."""
 
-try:
+import argparse
+import itertools
+import json
+import sys
+import urllib.error
+import urllib.request
+
+if __package__:
+    from . import config
+else:
     import config
-    URL = config.get_mcp_url()
-except Exception:
-    URL = "http://127.0.0.1:23120/mcp"
-_session_id = None
 
-def _post(payload, extra_headers=None):
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-    if _session_id:
-        headers["Mcp-Session-Id"] = _session_id
-    if extra_headers:
-        headers.update(extra_headers)
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(URL, data=data, headers=headers, method="POST")
-    try:
-        resp = urllib.request.urlopen(req, timeout=60)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        return e.code, dict(e.headers), body
-    return resp.status, dict(resp.headers), resp.read().decode()
 
-def _parse(resp_body):
-    """Parse SSE or plain JSON response, return the result object."""
-    body = resp_body.strip()
-    if body.startswith("event:") or body.startswith("data:"):
-        # SSE: find the data: line with the JSON-RPC response
-        for line in body.splitlines():
-            if line.startswith("data:"):
-                payload = line[5:].strip()
-                if payload:
-                    try:
-                        obj = json.loads(payload)
-                        if "result" in obj:
-                            return obj["result"]
-                        if "error" in obj:
-                            return {"error": obj["error"]}
-                    except json.JSONDecodeError:
-                        pass
-        return {"raw_sse": body}
-    else:
+class MCPError(RuntimeError):
+    """The server could not complete an MCP request."""
+
+
+def _result(message, request_id):
+    if not isinstance(message, dict) or message.get("id") != request_id:
+        raise MCPError("MCP response does not match the request ID")
+    if "error" in message:
+        raise MCPError(f"MCP error: {message['error']}")
+    if "result" not in message:
+        raise MCPError("MCP response has no result")
+    return message["result"]
+
+
+def _read_sse(response, request_id):
+    """Stop at the matching event without waiting for the server to close the stream."""
+    data = []
+    for raw_line in response:
+        line = raw_line.decode("utf-8").rstrip("\r\n")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip(" "))
+        elif not line and data:
+            message = json.loads("\n".join(data))
+            data = []
+            if isinstance(message, dict) and message.get("id") == request_id:
+                return _result(message, request_id)
+    if data:
+        return _result(json.loads("\n".join(data)), request_id)
+    raise MCPError("MCP stream ended without a matching response")
+
+
+class MCPClient:
+    """One sequential session; stateless servers may omit a session ID."""
+
+    def __init__(self, url=None, timeout=60):
+        self.url = url or config.get_mcp_url()
+        self.timeout = timeout
+        self.session_id = None
+        self.protocol_version = "2024-11-05"
+        self._ids = itertools.count(1)
+        self._initialized = False
+
+    def _post(self, method, params=None, *, notification=False):
+        payload = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        if not notification:
+            payload["id"] = next(self._ids)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self._initialized or method == "notifications/initialized":
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        request = urllib.request.Request(
+            self.url, json.dumps(payload).encode(), headers, method="POST"
+        )
         try:
-            obj = json.loads(body)
-            if "result" in obj:
-                return obj["result"]
-            if "error" in obj:
-                return {"error": obj["error"]}
-            return obj
-        except json.JSONDecodeError:
-            return {"raw": body}
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                if notification:
+                    return None
+                if method == "initialize":
+                    self.session_id = response.headers.get("Mcp-Session-Id")
+                content_type = response.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    return _read_sse(response, payload["id"])
+                return _result(json.load(response), payload["id"])
+        except urllib.error.HTTPError as error:
+            error.close()
+            raise MCPError(f"MCP HTTP {error.code} during {method}") from error
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            raise MCPError(f"MCP {method} failed: {error}") from error
+
+    def initialize(self):
+        if not self._initialized:
+            result = self._post(
+                "initialize",
+                {
+                    "protocolVersion": self.protocol_version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "reverse-zotero-insert", "version": "3.1.0"},
+                },
+            )
+            if not isinstance(result, dict) or not result.get("protocolVersion"):
+                raise MCPError("Invalid MCP initialize response")
+            self.protocol_version = result["protocolVersion"]
+            self._post("notifications/initialized", notification=True)
+            self._initialized = True
+        return self.session_id
+
+    def call_tool(self, name, arguments=None):
+        self.initialize()
+        result = self._post("tools/call", {"name": name, "arguments": arguments or {}})
+        if not isinstance(result, dict):
+            raise MCPError("Invalid MCP tool response")
+        if result.get("isError"):
+            raise MCPError(f"MCP tool {name} failed: {result.get('content', [])}")
+        if "structuredContent" in result:
+            decoded = result["structuredContent"]
+        elif "content" in result:
+            texts = []
+            for block in result["content"]:
+                if block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+                elif block.get("type") == "json":
+                    texts.append(json.dumps(block.get("json"), ensure_ascii=False))
+            text = "\n".join(texts)
+            try:
+                decoded = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+        else:
+            decoded = result
+        if isinstance(decoded, dict) and decoded.get("error"):
+            raise MCPError(f"MCP tool {name} failed: {decoded['error']}")
+        return decoded
+
+
+_default_client = None
+
+
+def _client():
+    global _default_client
+    if _default_client is None:
+        _default_client = MCPClient()
+    return _default_client
+
 
 def initialize():
-    global _session_id
-    payload = {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-        "protocolVersion":"2024-11-05",
-        "capabilities":{},
-        "clientInfo":{"name":"claude-helper","version":"1.0"}}}
-    code, headers, body = _post(payload)
-    # capture session id
-    for k,v in headers.items():
-        if k.lower() == "mcp-session-id":
-            _session_id = v
-    # send initialized notification
-    _post({"jsonrpc":"2.0","method":"notifications/initialized"})
-    return _session_id
+    return _client().initialize()
 
-# JSON-RPC id 需逐次递增，部分实现会拒绝重复 id
-_request_id = {"n": 0}
-def _next_id():
-    _request_id["n"] += 1
-    return _request_id["n"]
 
 def call_tool(name, arguments=None):
-    if not _session_id:
-        initialize()
-    payload = {"jsonrpc":"2.0","id":_next_id(),"method":"tools/call",
-               "params":{"name":name,"arguments":arguments or {}}}
-    code, headers, body = _post(payload)
-    res = _parse(body)
-    # tool results come as content array; extract text
-    if isinstance(res, dict):
-        if "content" in res and isinstance(res["content"], list):
-            texts = []
-            for c in res["content"]:
-                if c.get("type") == "text":
-                    texts.append(c.get("text",""))
-                elif c.get("type") == "json":
-                    texts.append(json.dumps(c.get("json",""), ensure_ascii=False))
-            joined = "\n".join(texts)
-            # try to parse as JSON for structured results
-            try:
-                return json.loads(joined)
-            except json.JSONDecodeError:
-                return joined
-        if "error" in res:
-            return {"error": res["error"]}
-    return res
+    return _client().call_tool(name, arguments)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("tool")
+    parser.add_argument("arguments", nargs="?", default="{}", type=json.loads)
+    args = parser.parse_args(argv)
+    try:
+        result = call_tool(args.tool, args.arguments)
+    except MCPError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: zotero_mcp.py <tool_name> [json_args]")
-        sys.exit(1)
-    tool = sys.argv[1]
-    args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
-    sid = initialize()
-    print(f"SESSION: {sid}", file=sys.stderr)
-    result = call_tool(tool, args)
-    print(json.dumps(result, ensure_ascii=False, indent=2) if not isinstance(result, str) else result)
+    sys.exit(main())
