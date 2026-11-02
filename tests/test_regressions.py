@@ -4,7 +4,10 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -120,6 +123,31 @@ class DocumentRegressions(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             code = audit.main(["docx_audit.py", "audit", self.source, self.source, str(path)])
         self.assertEqual(code, 1)
+
+    def test_cli_json_preserves_unicode_with_legacy_output_encoding(self):
+        self.source = str(Path(self.temp.name) / "中文稿件.docx")
+        self.document("Unconverted (doi:10.1000/example).")
+        path = Path(self.temp.name) / "mapping.json"
+        path.write_text(json.dumps(self.mapping), encoding="utf-8")
+        commands = [
+            (["scan", self.source, "--json"], 0),
+            (["audit", self.source, self.source, str(path), "--json"], 1),
+        ]
+        for arguments, expected_code in commands:
+            with self.subTest(command=arguments[0]):
+                result = subprocess.run(
+                    [sys.executable, str(Path(audit.__file__).resolve()), *arguments],
+                    env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, expected_code, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                report = json.loads(result.stdout)
+                if arguments[0] == "scan":
+                    self.assertEqual(report["file"], "中文稿件.docx")
+                else:
+                    self.assertEqual(report["matched"], 0)
+                    self.assertEqual(report["problems"][0]["why"], "未找到对应域")
 
     def test_empty_renumber_selection_changes_nothing(self):
         self.document("Claim (Smith, 2007).")

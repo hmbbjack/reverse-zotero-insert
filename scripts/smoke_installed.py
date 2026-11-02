@@ -16,7 +16,7 @@ assert reference_ingest.normalize_doi("DOI:10.1000/Example.") == "10.1000/exampl
 assert callable(zotero_mcp.MCPClient().call_tool)
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
-    src, out = root / "input.docx", root / "output.docx"
+    src, out = root / "输入.docx", root / "输出.docx"
     doc = Document()
     doc.add_paragraph("First\tline\nClaim (doi:10.1000/example).")
     doc.add_paragraph("Second (doi:10.1000/example).")
@@ -42,13 +42,15 @@ with tempfile.TemporaryDirectory() as directory:
         capture_output=True,
         text=True,
     )
-    assert json.loads(scanned.stdout)["placeholder_groups"] == 2
+    scan_report = json.loads(scanned.stdout)
+    assert scan_report["placeholder_groups"] == 2
+    assert scan_report["file"] == src.name
     assert zotero_field_insert.insert_zotero_fields(src, out, (0, 2), [2], mapping) == (2, 1)
     ok, report = zotero_field_insert.verify(out, {"ABCD1234"}, src, mapping, deep=True)
     assert ok, report
     assert "\t" in Document(out).paragraphs[1].text
     path = root / "mapping.json"
-    path.write_text(json.dumps(mapping))
+    path.write_text(json.dumps(mapping), encoding="utf-8")
     command = [
         sys.executable,
         "-m",
@@ -64,6 +66,10 @@ with tempfile.TemporaryDirectory() as directory:
     command[5] = str(src)
     bad = subprocess.run(command, capture_output=True, text=True)
     assert bad.returncode == 1, (bad.returncode, bad.stdout, bad.stderr)
+    bad_report = json.loads(bad.stdout)
+    assert bad_report["matched"] == 0
+    assert len(bad_report["problems"]) == 2
+    assert all(problem["why"] == "未找到对应域" for problem in bad_report["problems"])
 print(
     f"Installed package {__version__}: imports, scan, conversion, deep verify, CLI exit codes PASS"
 )

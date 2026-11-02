@@ -39,7 +39,7 @@ cd /tmp
 ```
 
 Windows virtual environments use `Scripts/python.exe`.
-CI is configured for Linux/Windows and Python 3.10, 3.12, and 3.13. Passing local
+CI is configured for macOS, Linux, and Windows with Python 3.10, 3.12, and 3.13. Passing local
 checks does not mean that these remote jobs have already run.
 
 ## Publish a GitHub release

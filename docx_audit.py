@@ -422,13 +422,14 @@ def main(argv=None):
         if args.command == "scan":
             report = scan_document(args.document, verbose=not args.json)
             if args.json:
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+                # Escaped Unicode keeps piped JSON valid on legacy Windows code pages.
+                print(json.dumps(report, ensure_ascii=True, indent=2))
         elif args.command == "audit":
             with open(args.mapping, encoding="utf-8") as source:
                 mapping = json.load(source)
             report = audit_output(args.source, args.output, mapping, verbose=not args.json)
             if args.json:
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+                print(json.dumps(report, ensure_ascii=True, indent=2))
             return 1 if report["problems"] else 0
         elif args.command == "renumber":
             count = renumber_citation_ids(

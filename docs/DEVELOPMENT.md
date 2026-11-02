@@ -36,7 +36,7 @@ cd /tmp
 /tmp/reverse-zotero-package-test/bin/python -m reverse_zotero_insert --help
 ```
 
-Windows 虚拟环境中的 Python 位于 `Scripts/python.exe`。CI 已配置 Linux/Windows 与 Python 3.10、3.12、3.13 的测试矩阵；本地通过不代表这些远程任务已经执行。
+Windows 虚拟环境中的 Python 位于 `Scripts/python.exe`。CI 已配置 macOS、Linux、Windows 与 Python 3.10、3.12、3.13 的测试矩阵；本地通过不代表这些远程任务已经执行。
 
 ## GitHub Release
 
