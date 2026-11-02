@@ -99,8 +99,8 @@ ok, details = fields.verify(
 if not ok:
     raise RuntimeError(details)
 report = audit.audit_output("manuscript.docx", "manuscript_zotero.docx", mapping)
-if report["problems"]:
-    raise RuntimeError(report["problems"])
+if report["problems"] or report["structure_errors"] or report["nested_citations"]:
+    raise RuntimeError(report)
 ```
 
 Prefer a new output file. Atomic writing also protects against truncation when the
@@ -114,6 +114,7 @@ Set `refnum_column=None` to replace the DOI cell itself.
 ## Understand the checks
 
 - `verify()` checks field structure, citation JSON, item keys, and required CSL fields.
+  Nested Zotero citations fail verification; valid nesting of ordinary Word fields is preserved.
 - Providing the source and mapping enables occurrence-by-occurrence omission checks.
 - `deep=True` adds duplicate citation IDs and residual DOI placeholders.
 - `audit_output()` reconciles pure DOI parenthetical groups by display text, DOI, and item key.
@@ -125,5 +126,9 @@ reverse-zotero-insert audit manuscript.docx manuscript_zotero.docx item_mapping.
 reverse-zotero-insert renumber manuscript_zotero.docx --from manuscript.docx --dry-run
 ```
 
-Audit exit codes: `0` no discrepancies, `1` discrepancies found, `2` argument/file errors.
+Audit success requires an empty `problems` list, `structure_errors == 0`, and `nested_citations == 0`.
+Shared parsing protects existing fields across paragraphs and around bookmarks and proofing markers,
+so repeated conversion leaves their cached citation text intact.
+
+Audit exit codes: `0` no discrepancies, `1` reconciliation or field structure errors, `2` argument/file errors.
 After XML checks pass, open the result in the target Word/Zotero environment and verify refresh behavior.

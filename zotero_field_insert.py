@@ -30,10 +30,12 @@ if __package__:
     from . import config
     from .docx_io import load_root, save_document
     from .doi_utils import DOI_TOKEN, DOI_PART, DOI_PREFIX, PAREN_GROUP, normalize_doi
+    from .word_fields import W, instruction_text, parse_fields
 else:
     import config
     from docx_io import load_root, save_document
     from doi_utils import DOI_TOKEN, DOI_PART, DOI_PREFIX, PAREN_GROUP, normalize_doi
+    from word_fields import W, instruction_text, parse_fields
 
 
 def _resolve_uri_prefix(uri_prefix):
@@ -50,7 +52,6 @@ def _item_uri(item, uri_prefix):
     return _resolve_uri_prefix(uri_prefix) + item["itemKey"]
 
 
-W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 SCHEMA = "https://github.com/citation-style-language/schema/raw/master/csl-citation.json"
 XMLSPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
@@ -383,7 +384,7 @@ def _slice_runs(runs, run_texts, positions, cs, ce):
 
 
 # ---------- 已有 Zotero 域代码检测（混合文档支持） ----------
-def _detect_existing(body):
+def _detect_existing(body, field_index=None):
     """扫描 body，返回已存在的 Zotero 域信息。
 
     支持"既有域代码又有纯文字"的混合文档：已插入引文域的段落原样保留，
@@ -392,34 +393,18 @@ def _detect_existing(body):
     插件把一个域的指令拆成多个 <w:instrText> 的情况。
     返回 {"cited_paras": set(段落索引), "has_bibliography": bool, "has_preferences": bool}
     """
-    paras = body.findall(W + "p")
+    parsed = parse_fields(body) if field_index is None else field_index
+    paras = {p: i for i, p in enumerate(body.findall(W + "p"))}
     has_bib = has_prefs = False
     cited = set()
-    in_f = False
-    cur = []
-    start_para = -1
-    for i, p in enumerate(paras):
-        for r in p.iter(W + "r"):
-            for ch in r:
-                tg = etree.QName(ch).localname
-                if tg == "fldChar":
-                    ft = ch.get(W + "fldCharType")
-                    if ft == "begin":
-                        in_f = True
-                        cur = []
-                        start_para = i
-                    elif ft == "end" and in_f:
-                        t = "".join(cur)
-                        if "ZOTERO_ITEM CSL_CITATION" in t:
-                            cited.add(start_para)
-                        if "ZOTERO_BIBL" in t:
-                            has_bib = True
-                        if "ZOTERO_DOCUMENT_PREFERENCES" in t:
-                            has_prefs = True
-                        in_f = False
-                        cur = []
-                elif tg == "instrText" and in_f:
-                    cur.append(ch.text or "")
+    for current in parsed.fields:
+        if current.end is None:
+            continue
+        instruction = current.instruction
+        if "ZOTERO_ITEM CSL_CITATION" in instruction and current.paragraph in paras:
+            cited.add(paras[current.paragraph])
+        has_bib |= "ZOTERO_BIBL" in instruction
+        has_prefs |= "ZOTERO_DOCUMENT_PREFERENCES" in instruction
     return {"cited_paras": cited, "has_bibliography": has_bib, "has_preferences": has_prefs}
 
 
@@ -438,51 +423,18 @@ def detect_zotero_fields(docx_path):
 
 
 def collect_fields(root, with_display=True):
-    """域级收集文档中所有域。返回 [(instrText元素列表, 显示文本, 起始段落序号)]。
+    """收集所有闭合域，含嵌套域。返回 [(指令节点列表, 显示文本, 起始段落序号)]。
 
     - 深度跨段落连续传递：跨段域（BIBL/长 PREF）也能正确收口。
-    - instrText 存 **元素**（不是字符串），便于就地重写（重编号/重链接）。
+    - 指令存 **元素**：复杂域的 instrText 或简单域的 fldSimple，支持就地重写。
     - 显示文本 = begin..separate..end 之间的 w:t 拼接；无 separate 时为空串。
     """
-    fields = []
-    depth = 0
-    cur = None
-    disp = []
-    state = "pre"
-    start_para = -1
-    para_i = -1
-    for p in root.iter(W + "p"):
-        para_i += 1
-        for r in p.iter(W + "r"):
-            for ch in r:
-                tg = etree.QName(ch).localname
-                if tg == "fldChar":
-                    ft = ch.get(W + "fldCharType")
-                    if ft == "begin":
-                        depth += 1
-                        if depth == 1:
-                            cur = []
-                            disp = []
-                            state = "instr"
-                            start_para = para_i
-                    elif ft == "separate":
-                        if depth >= 1:
-                            state = "disp"
-                    elif ft == "end":
-                        if depth == 1 and cur is not None:
-                            fields.append((cur, "".join(disp) if with_display else "", start_para))
-                            cur = None
-                        depth = max(0, depth - 1)
-                elif tg == "instrText" and depth >= 1 and state == "instr" and cur is not None:
-                    cur.append(ch)
-                elif tg == "t" and depth >= 1 and state == "disp" and with_display:
-                    disp.append(ch.text or "")
-    return fields
+    return parse_fields(root).collected(with_display=with_display)
 
 
 def field_instr_text(els):
     """域级 instrText 拼接（跨 run / 跨 instrText 元素）。"""
-    return "".join(e.text or "" for e in els)
+    return instruction_text(els)
 
 
 def field_payload(els):
@@ -504,23 +456,9 @@ def outside_field_paragraphs(root):
     用途：找"真正的纯文字占位"。既有域的显示文本里常含 DOI 字样（显示文本=原文的
     转换结果），必须排除，否则会把已转换的引文误报成漏转。
     """
-    depth = 0
-    para_i = -1
-    for p in root.iter(W + "p"):
-        para_i += 1
-        parts = []
-        for r in p.iter(W + "r"):
-            for ch in r:
-                tg = etree.QName(ch).localname
-                if tg == "fldChar":
-                    ft = ch.get(W + "fldCharType")
-                    if ft == "begin":
-                        depth += 1
-                    elif ft == "end":
-                        depth = max(0, depth - 1)
-                elif tg == "t" and depth == 0:
-                    parts.append(ch.text or "")
-        yield para_i, "".join(parts)
+    parsed = parse_fields(root)
+    for index, paragraph in enumerate(parsed.paragraphs):
+        yield index, parsed.outside[paragraph]
 
 
 def _is_placeholder_doi(text):
@@ -610,72 +548,15 @@ def _citation_id_start(existing_ids, prefix="cit"):
     return mx + 1
 
 
-def _cell_has_citation(tc):
+def _cell_has_citation(tc, field_index=None):
     """判断表格单元格（w:tc）是否已含引文域。同样拼接域内 instrText 以兼容 Word 拆分。"""
-    in_f = False
-    cur = []
-    for r in tc.iter(W + "r"):
-        for ch in r:
-            tg = etree.QName(ch).localname
-            if tg == "fldChar":
-                ft = ch.get(W + "fldCharType")
-                if ft == "begin":
-                    in_f = True
-                    cur = []
-                elif ft == "end" and in_f:
-                    if "ZOTERO_ITEM CSL_CITATION" in "".join(cur):
-                        return True
-                    in_f = False
-                    cur = []
-            elif tg == "instrText" and in_f:
-                cur.append(ch.text or "")
-    return False
-
-
-# ---------- 同段混合支持：段落内保留已有域，只转换纯文字引文 ----------
-def _field_ranges(children):
-    """返回 children 中构成 Word 域的连续子元素索引区间 [(start, end)]（含端）。
-
-    按 fldChar begin..end 配对（兼容嵌套）。这些区间在重建段落时原样保留，
-    只转换区间外的纯文字引文 —— 支持"同一段落内既有域代码又有纯文字"。
-    """
-    ranges = []
-    i = 0
-    n = len(children)
-    while i < n:
-        if etree.QName(children[i]).localname != "r":
-            i += 1
-            continue
-        if not any(
-            etree.QName(c).localname == "fldChar" and c.get(W + "fldCharType") == "begin"
-            for c in children[i]
-        ):
-            i += 1
-            continue
-        depth = 0
-        j = i
-        end_at = None
-        while j < n and etree.QName(children[j]).localname == "r":
-            for c in children[j]:
-                if etree.QName(c).localname != "fldChar":
-                    continue
-                ft = c.get(W + "fldCharType")
-                if ft == "begin":
-                    depth += 1
-                elif ft == "end":
-                    depth -= 1
-                    if depth == 0:
-                        end_at = j
-                        break
-            if end_at is not None:
-                break
-            j += 1
-        if end_at is not None:
-            ranges.append((i, end_at))
-            i = end_at + 1
-        else:
-            i += 1
-    return ranges
+    parsed = parse_fields(tc) if field_index is None else field_index
+    return any(
+        current.end is not None
+        and "ZOTERO_ITEM CSL_CITATION" in current.instruction
+        and any(parent is tc for parent in current.start.iterancestors())
+        for current in parsed.fields
+    )
 
 
 def _convert_runs(runs, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_start=0):
@@ -724,30 +605,33 @@ def _convert_runs(runs, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, c
     return new_children, cit_n
 
 
-def _run_fragments(run):
+def _run_fragments(run, protected=()):
     """Yield (fragment, is_text), retaining tabs, breaks, pictures, and run attributes."""
     content = [child for child in run if child.tag != W + "rPr"]
-    if not content or all(child.tag == W + "t" for child in content):
-        yield run, bool(content)
+    convertible = [child.tag == W + "t" and child not in protected for child in content]
+    if not any(convertible) or all(convertible):
+        yield run, bool(content) and all(convertible)
         return
-    for child in content:
+    for child, is_text in zip(content, convertible):
         fragment = etree.Element(run.tag, dict(run.attrib), nsmap=run.nsmap)
         properties = run.find(W + "rPr")
         if properties is not None:
             fragment.append(copy.deepcopy(properties))
-        fragment.append(copy.deepcopy(child))
-        yield fragment, child.tag == W + "t"
+        fragment.append(child)
+        yield fragment, is_text
 
 
-def _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_start=0):
+def _process_para(
+    p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_start=0, field_index=None
+):
     """重建单个正文段落，支持同段混合：已有 Word/Zotero 域原样保留，只转换纯文字引文。
 
     hyperlink 与 pPr 等非 run 子元素原样保留（不转换超链接内的引文）。
     ⚠️ proofErr/lastRenderedPageBreak 是 Word 的拼写/渲染标记，会随文出现在任意两 run
     之间；若按普通元素 flush，会把一个括号引文组切成多段而整组漏转 -- 这里直接丢弃。
-    书签不含文本，直通且不 flush（保留原位，避免同样切断文本块）。"""
+    已有域内的标记完整保留；域外书签保留原位并切断待转换文本块。"""
     children = list(p)
-    field_ranges = _field_ranges(children)
+    parsed = parse_fields(p) if field_index is None else field_index
     new_children = []
     text_block = []
 
@@ -761,26 +645,18 @@ def _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_
         new_children.extend(converted)
         text_block = []
 
-    fi = 0
-    i = 0
-    n = len(children)
-    while i < n:
-        if fi < len(field_ranges) and field_ranges[fi][0] == i:
-            flush()
-            start, end = field_ranges[fi]
-            fi += 1
-            new_children.extend(children[start : end + 1])
-            i = end + 1
-            continue
-        el = children[i]
+    for el in children:
         tag = etree.QName(el).localname
         if tag == "r":
-            for fragment, is_text in _run_fragments(el):
+            for fragment, is_text in _run_fragments(el, parsed.protected):
                 if is_text:
                     text_block.append(fragment)
                 else:
                     flush()
                     new_children.append(fragment)
+        elif el in parsed.protected:
+            flush()
+            new_children.append(el)
         elif tag in ("proofErr", "lastRenderedPageBreak"):
             pass  # Word 拼写/渲染标记：丢弃，不切断文本块（Word 会自行重建）
         elif tag in ("bookmarkStart", "bookmarkEnd"):
@@ -795,7 +671,6 @@ def _process_para(p, finder, uri_prefix, item_mapping, iid, csl_for, cit_n, cit_
         else:  # pPr / w:ins 等
             flush()
             new_children.append(el)
-        i += 1
     flush()
     for ch in list(p):
         p.remove(ch)
@@ -875,8 +750,9 @@ def insert_zotero_fields(
     root = load_root(src_docx)
     body = root.find(W + "body")
     paras = body.findall(W + "p")
+    parsed = parse_fields(root)
     existing = (
-        _detect_existing(body)
+        _detect_existing(body, parsed)
         if skip_existing
         else {"cited_paras": set(), "has_bibliography": False, "has_preferences": False}
     )
@@ -896,7 +772,11 @@ def insert_zotero_fields(
     # v3：新域 citationID 自动避开文档中已存在的编号（否则跨版本/复制段落必撞号）。
     # cit_start 只是编号偏移；cit_holder 仍从 0 计新增域数，函数返回值语义不变。
     cit_start = _citation_id_start(
-        [obj.get("citationID") for els, _, _ in collect_fields(root) if (obj := field_payload(els))]
+        [
+            obj.get("citationID")
+            for els, _, _ in collect_fields(parsed)
+            if (obj := field_payload(els))
+        ]
     )
     cit_holder = [0]
 
@@ -904,7 +784,15 @@ def insert_zotero_fields(
     # 1) 正文引文域（支持同段混合：保留已有 Word/Zotero 域，只转换纯文字引文）
     for idx in range(b0, b1):
         cit_holder[0] = _process_para(
-            paras[idx], finder, uri_prefix, item_mapping, iid, csl_for, cit_holder[0], cit_start
+            paras[idx],
+            finder,
+            uri_prefix,
+            item_mapping,
+            iid,
+            csl_for,
+            cit_holder[0],
+            cit_start,
+            field_index=parsed,
         )
 
     # 1b) 表格内段落（可选）：独立 DOI 格整格替换；其余走同一段落转换
@@ -912,7 +800,15 @@ def insert_zotero_fields(
         for p in body.iter(W + "p"):
             if any(parent.tag == W + "tc" for parent in p.iterancestors()):
                 cit_holder[0] = _process_para(
-                    p, finder, uri_prefix, item_mapping, iid, csl_for, cit_holder[0], cit_start
+                    p,
+                    finder,
+                    uri_prefix,
+                    item_mapping,
+                    iid,
+                    csl_for,
+                    cit_holder[0],
+                    cit_start,
+                    field_index=parsed,
                 )
 
     cit_n = cit_holder[0]
@@ -984,8 +880,9 @@ def insert_table_citations(
     if tbl is None:
         return 0  # 文档无表格，直接返回
     rows = tbl.findall(W + "tr")
+    parsed = parse_fields(root)
     existing = (
-        _detect_existing(body)
+        _detect_existing(body, parsed)
         if skip_existing
         else {"cited_paras": set(), "has_bibliography": False, "has_preferences": False}
     )
@@ -1006,7 +903,7 @@ def insert_table_citations(
     cit_start = _citation_id_start(
         [
             obj.get("citationID")
-            for els, _, _ in collect_fields(root)
+            for els, _, _ in collect_fields(parsed)
             if (obj := field_payload(els))
         ],
         prefix="tcit",
@@ -1027,7 +924,7 @@ def insert_table_citations(
         if p is None:
             continue
         # 该 Ref 单元格已含引文域则跳过（混合文档）
-        if skip_existing and _cell_has_citation(ref_tc):
+        if skip_existing and _cell_has_citation(ref_tc, parsed):
             continue
         runs = p.findall(W + "r")
         rpr = runs[0].find(W + "rPr") if runs else None
@@ -1145,7 +1042,8 @@ def verify(
     这三项进 detail，且影响 ok。
     """
     root = load_root(out_docx)
-    fields = collect_fields(root)
+    parsed = parse_fields(root)
+    fields = collect_fields(parsed)
     cites = bibs = prefs = 0
     bad_json = bad_uri = incomplete = with_abstract = 0
     valid_item_keys = set(valid_item_keys)
@@ -1197,36 +1095,19 @@ def verify(
         else:
             prefs += 1
 
-    bg = ed = structure_errors = 0
-    stack = []
-    for marker in root.iter(W + "fldChar"):
-        kind = marker.get(W + "fldCharType")
-        if kind == "begin":
-            bg += 1
-            stack.append(False)
-        elif kind == "separate":
-            if not stack or stack[-1]:
-                structure_errors += 1
-            else:
-                stack[-1] = True
-        elif kind == "end":
-            ed += 1
-            if stack:
-                stack.pop()
-            else:
-                structure_errors += 1
-    structure_errors += len(stack)
-    ok = not (structure_errors or bad_json or bad_uri or incomplete)
+    nested_citations = parsed.nested_count("ZOTERO_ITEM CSL_CITATION")
+    ok = not (parsed.structure_errors or nested_citations or bad_json or bad_uri or incomplete)
     detail = dict(
         cites=cites,
         bibs=bibs,
         prefs=prefs,
-        fldChar=f"{bg}/{ed}",
+        fldChar=f"{parsed.begins}/{parsed.ends}",
         bad_json=bad_json,
         bad_uri=bad_uri,
         incomplete=incomplete,
         with_abstract=with_abstract,
-        structure_errors=structure_errors,
+        structure_errors=parsed.structure_errors,
+        nested_citations=nested_citations,
     )
     if src_docx and item_mapping:
         missed, mism = _verify_zero_miss(src_docx, out_docx, item_mapping, citation_text_map)
@@ -1234,8 +1115,8 @@ def verify(
         detail["display_mismatches"] = mism
         ok = ok and not missed and not mism
     if deep:
-        stats = citation_id_stats(root)
-        residual = residual_placeholders(root)
+        stats = citation_id_stats(parsed)
+        residual = residual_placeholders(parsed)
         detail["citation_ids"] = {k: v for k, v in stats.items() if k != "ids"}
         detail["residual_placeholders"] = residual
         ok = ok and not stats["duplicates"] and not residual

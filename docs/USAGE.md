@@ -114,14 +114,16 @@ ok, missing = verify_item_keys(da.zfi.document_item_keys(da.load_root("论文_zo
 
 `verify(out, valid_keys, src_docx, item_mapping, deep=True)` 检查：
 
-- 结构：fldChar begin/separate/end 配对平衡、所有域的 JSON 合法（域级拼接 instrText 后解析）
+- 结构：fldChar begin/separate/end 配对平衡、Zotero 域的 JSON 合法、没有嵌套的 Zotero 引用；普通 Word 域的合法嵌套仍可保留
 - 链接：所有 URI 的 key 属于调用者传入的有效集合、itemData 含 type/title/author/issued；真实库内存在性另用 `verify_item_keys()` 检查
 - 零遗漏：与原文比对，每处应转换的引文都出现在输出域的显示文本里，且逐字一致
 - `deep=True` 追加：citationID 唯一性、域外残留纯文字占位（跨段深度感知）
 
 `docx_audit.audit_output(src, out, item_mapping)` 对纯 DOI 括号组逐组核对显示文本、DOI 集合与 URI 指向；作者年份、独立 DOI 和精确文本引用的遗漏检查由 `verify()` 完成。
 
-命令行 `audit` 的退出码为：`0` 无异常，`1` 对账失败，`2` 参数或文件错误。
+审计通过须同时满足 `problems == []`、`structure_errors == 0` 和 `nested_citations == 0`。域解析统一处理跨段文献表、域内书签与拼写标记，已有引用的显示文本不会再次转换。
+
+命令行 `audit` 的退出码为：`0` 无异常，`1` 对账或域结构检查失败，`2` 参数或文件错误。
 重编号与重链接支持 `--dry-run`。转换仍建议写入新文件；内部采用临时文件和原子替换，即使误用相同输入/输出路径，也不会先截断原稿。
 
 查重请求失败会抛出异常并停止当前导入流程；`apply_library_data()` 失败时不会留下部分更新的 mapping。

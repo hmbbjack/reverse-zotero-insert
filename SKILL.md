@@ -13,7 +13,7 @@ description: 当用户要求把参考文献以 Zotero 域代码格式插入/写�
 - pip 安装后可用 `reverse-zotero-insert scan ...` 和 `from reverse_zotero_insert import ...`；源码调用保持兼容。
 - `import_to_zotero()` 返回 `(imported, warnings)`，构造 mapping 前先解包并检查 warnings。
 - MCP/查重请求失败会抛出异常，不能当作“库内无重复”。`apply_library_data()` 失败时保留原 mapping。
-- `audit` 命令发现对账异常返回退出码 1；参数/文件错误返回 2。
+- `audit` 命令发现对账异常、域结构错误或嵌套的 Zotero 引用返回退出码 1；参数/文件错误返回 2。
 - 已有测试为离线/模拟服务验证；最终 Word/Zotero 刷新效果需在目标桌面环境验证。
 
 ## v3 新增（相对 v2）
@@ -99,10 +99,11 @@ URI 形如 `http://zotero.org/users/<userID>/items/<itemKey>`。`userID` 与 API
 
 **域与扫描**
 - **域深度必须跨段落连续传递**。文献表域跨成百上千段；逐段把深度重置为 0，会把文献表正文里的 `https://doi.org/…` 判成"域外残留占位"，虚增上百条假命中。用 `zfi.outside_field_paragraphs()` / `zfi.collect_fields()`，不要自己重写。
+- **统一使用 `word_fields.py` 的域状态解析**。书签、批注和拼写标记不结束域；嵌套域各自保留指令与显示文本。已有引用内再次嵌入 Zotero 引用属于异常，不能以 begin/end 数量平衡判定通过。
 - **域内缓存显示文本含 DOI 字样**。转换时显示文本 = 占位原文，所以"已转换"的引文在纯文本扫描里仍长得像占位。判断"是否还有真占位"只能用域深度感知扫描。
 - **一个域的指令可能被 Word 拆成多个 `<w:instrText>`**。必须域级拼接后再 `json.loads`；逐元素解析会把长 JSON 误报成截断错误。
 - **`collect_fields` 的 instrText 存元素不是字符串**（要就地重写就存元素）。
-- **Word 的 `<w:proofErr>` / `<w:lastRenderedPageBreak>` 会切断引文组**：转换器已作透明节点丢弃，别改回去。
+- **Word 的 `<w:proofErr>` / `<w:lastRenderedPageBreak>` 会切断引文组**：域外的段落级标记仍透明处理，已有域内的标记必须完整保留，不能重置域状态。
 - **`w:br` 软换行不产生字符**：多 DOI 单元格拼接文本会粘连成 `…012doi:10.x`，匹配失败。提取单元格文本时把 `br` 记作 `\n`。
 - **按段落号配对原稿与输出是不可靠的**：insert 会在文首插入首选项域段落，输出与原稿的段落序号整体位移。逐组对账按**显示文本多重集**配对。
 
@@ -134,7 +135,7 @@ URI 形如 `http://zotero.org/users/<userID>/items/<itemKey>`。`userID` 与 API
 ## 交付前硬性检查（7 项）
 
 1. `docx_audit.scan_document(out)` → 占位组 0、散落 DOI 0。
-2. `docx_audit.audit_output(src, out, item_mapping)` → `problems == []`（逐组对账）。
+2. `docx_audit.audit_output(src, out, item_mapping)` → `problems == []`、`structure_errors == 0`、`nested_citations == 0`（逐组对账及域结构检查）。
 3. `zfi.verify(out, valid_keys, src, item_mapping, deep=True)` → `ok == True`（含 citationID 撞号、域外残留、坏 JSON、坏 URI）。
 4. `reference_ingest.verify_item_keys(文档全部 key)` → `missing == []`；有 missing 用 `relink_item_keys()` 修（库里找同 DOI 的规范条目重链接），修不了才向用户报告。
 5. 域计数符合预期：`域 == 原域 + 新域`，fldChar begin/end 平衡。
@@ -146,6 +147,7 @@ URI 形如 `http://zotero.org/users/<userID>/items/<itemKey>`。`userID` 与 API
 | 文件 | 作用 |
 |---|---|
 | `zotero_field_insert.py` | 域代码生成器：匹配器、插入（正文/表格）、`verify()` |
+| `word_fields.py` | 共用 Word 域解析：跨段与嵌套状态、指令节点、域外文本、转换保护与结构检查 |
 | `reference_ingest.py` | 前端摄取：解析、联网核实、建库、导入、mapping 构建、库索引、死链校验 |
 | `docx_audit.py` | **v3**：扫描、占位提取、表格列审计、逐组对账、重编号、重链接、CLI |
 | `zotero_mcp.py` | Zotero MCP 的 JSON-RPC 客户端 |

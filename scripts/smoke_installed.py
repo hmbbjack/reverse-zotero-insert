@@ -7,6 +7,7 @@ import sys
 import tempfile
 
 from docx import Document
+from lxml import etree
 from reverse_zotero_insert import __version__
 from reverse_zotero_insert import docx_audit, reference_ingest, zotero_field_insert, zotero_mcp
 
@@ -49,6 +50,23 @@ with tempfile.TemporaryDirectory() as directory:
     ok, report = zotero_field_insert.verify(out, {"ABCD1234"}, src, mapping, deep=True)
     assert ok, report
     assert "\t" in Document(out).paragraphs[1].text
+    # Reprocessing a Word-edited citation must preserve it, including internal markers.
+    xml = docx_audit.load_root(out)
+    instruction = next(
+        element
+        for element in xml.iter(zotero_field_insert.W + "instrText")
+        if "CSL_CITATION" in (element.text or "")
+    )
+    paragraph = instruction.getparent().getparent()
+    for kind in ("spellStart", "spellEnd"):
+        proof = etree.Element(zotero_field_insert.W + "proofErr")
+        proof.set(zotero_field_insert.W + "type", kind)
+        paragraph.insert(paragraph.index(instruction.getparent()) + (kind == "spellEnd"), proof)
+    docx_audit.save_document(xml, out, out)
+    repeated = root / "重新处理.docx"
+    assert zotero_field_insert.insert_zotero_fields(out, repeated, (1, 3), [], mapping) == (0, 0)
+    ok, report = zotero_field_insert.verify(repeated, {"ABCD1234"}, src, mapping, deep=True)
+    assert ok and report["cites"] == 2, report
     path = root / "mapping.json"
     path.write_text(json.dumps(mapping), encoding="utf-8")
     command = [

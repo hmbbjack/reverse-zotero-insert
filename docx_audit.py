@@ -35,10 +35,12 @@ if __package__:
     from . import zotero_field_insert as zfi
     from .docx_io import load_root, save_document
     from .doi_utils import DOI_RE, extract_doi_groups, normalize_doi
+    from .word_fields import parse_fields, replace_instruction
 else:
     import zotero_field_insert as zfi
     from docx_io import load_root, save_document
     from doi_utils import DOI_RE, extract_doi_groups, normalize_doi
+    from word_fields import parse_fields, replace_instruction
 
 W = zfi.W
 SCHEMA = zfi.SCHEMA
@@ -64,28 +66,17 @@ def extract_loose_dois(text, covered=()):
 
 
 # ---------------------------------------------------------------- 扫描
-def _cell_outside_text(tc, depth0=True):
-    d = 0
-    parts = []
-    for r in tc.iter(W + "r"):
-        for ch in r:
-            ln = etree.QName(ch).localname
-            if ln == "fldChar":
-                ft = ch.get(W + "fldCharType")
-                if ft == "begin":
-                    d += 1
-                elif ft == "end":
-                    d = max(0, d - 1)
-            elif ln == "t" and (not depth0 or d == 0):
-                parts.append(ch.text or "")
-    return "".join(parts)
+def _cell_outside_text(tc, field_index=None):
+    parsed = parse_fields(tc) if field_index is None else field_index
+    return "".join(parsed.outside[p] for p in tc.iter(W + "p"))
 
 
-def _tc_has_field(tc):
-    return any(c.get(W + "fldCharType") == "begin" for c in tc.iter(W + "fldChar"))
+def _tc_has_field(tc, field_index=None):
+    parsed = parse_fields(tc) if field_index is None else field_index
+    return any(element in parsed.protected for element in tc.iter())
 
 
-def table_column_audit(root):
+def table_column_audit(root, field_index=None):
     """逐表逐列审计：区分"引文列"与"数据列"。
 
     表格里"纯数字格"绝大多数是数据（年龄 6–8、周期 14 天…），不是引文；
@@ -94,23 +85,24 @@ def table_column_audit(root):
     doi_cells, number_cells, citation_cells}]}]
     """
     body = root.find(W + "body")
+    parsed = parse_fields(root) if field_index is None else field_index
     report = []
     for ti, tbl in enumerate(body.findall(W + "tbl")):
         rows = tbl.findall(W + "tr")
         if not rows:
             continue
         ncols = max(len(r.findall(W + "tc")) for r in rows)
-        header = [_cell_outside_text(tc).strip()[:24] for tc in rows[0].findall(W + "tc")]
+        header = [_cell_outside_text(tc, parsed).strip()[:24] for tc in rows[0].findall(W + "tc")]
         cols = []
         for ci in range(ncols):
             cells = [r.findall(W + "tc")[ci] for r in rows if ci < len(r.findall(W + "tc"))]
             with_field = doi_cells = number_cells = citation_cells = 0
             samples = {"doi": [], "number": [], "citation": []}
             for ri, tc in enumerate(cells):
-                if _tc_has_field(tc):
+                if _tc_has_field(tc, parsed):
                     with_field += 1
                     continue
-                t = _cell_outside_text(tc).strip()
+                t = _cell_outside_text(tc, parsed).strip()
                 if not t:
                     continue
                 if DOI_RE.search(t):
@@ -145,7 +137,8 @@ def scan_document(path, verbose=True):
     root = load_root(path)
     body = root.find(W + "body")
     paras = body.findall(W + "p")
-    fields = zfi.collect_fields(root)
+    parsed = parse_fields(root)
+    fields = zfi.collect_fields(parsed)
     items = bibs = prefs = 0
     style = None
     for els, _, _ in fields:
@@ -160,7 +153,7 @@ def scan_document(path, verbose=True):
             style = (obj.get("style") or {}).get("styleID")
     # 域外占位组（跨段深度感知，BIBL 内的文献不会混进来）
     groups = []
-    for i, txt in zfi.outside_field_paragraphs(root):
+    for i, txt in zfi.outside_field_paragraphs(parsed):
         gs = extract_doi_groups(txt)
         for s, e, g, dois in gs:
             groups.append({"para": i, "span": [s, e], "text": g, "dois": dois})
@@ -170,8 +163,8 @@ def scan_document(path, verbose=True):
     mixed_paras = sorted(
         {g["para"] for g in groups if "span" in g and any(f[2] == g["para"] for f in fields)}
     )
-    stats = zfi.citation_id_stats(root)
-    keys = zfi.document_item_keys(root)
+    stats = zfi.citation_id_stats(parsed)
+    keys = zfi.document_item_keys(parsed)
     from collections import Counter
 
     doi_count = Counter()
@@ -185,6 +178,8 @@ def scan_document(path, verbose=True):
         "paragraphs": len(paras),
         "tables": len(body.findall(W + "tbl")),
         "fields": {"total": len(fields), "item": items, "bibl": bibs, "prefs": prefs},
+        "structure_errors": parsed.structure_errors,
+        "nested_citations": parsed.nested_count("ZOTERO_ITEM CSL_CITATION"),
         "style": style,
         "placeholder_groups": len([g for g in groups if "span" in g]),
         "loose_dois": len([g for g in groups if "loose" in g]),
@@ -194,12 +189,16 @@ def scan_document(path, verbose=True):
         "citation_ids": {k: v for k, v in stats.items() if k != "ids"},
         "doc_item_keys": len(keys),
         "groups": groups,
-        "table_audit": table_column_audit(root),
+        "table_audit": table_column_audit(root, parsed),
     }
     if verbose:
         print(f"== {report['file']} ==")
         print(f"  段落 {report['paragraphs']}, 表格 {report['tables']}, 样式 {style}")
         print(f"  域: 共 {len(fields)} (引文 {items}, 文献表 {bibs}, 首选项 {prefs})")
+        if report["structure_errors"] or report["nested_citations"]:
+            print(
+                f"  域结构异常 {report['structure_errors']}, 嵌套引文 {report['nested_citations']}"
+            )
         print(
             f"  域外占位组 {report['placeholder_groups']} (散落 DOI {report['loose_dois']}), "
             f"唯一 DOI {report['unique_dois']}"
@@ -232,9 +231,7 @@ def _rewrite_field(els, obj):
     full = zfi.field_instr_text(els)
     marker = "CSL_CITATION"
     head = full[: full.index(marker) + len(marker)]
-    els[0].text = head + " " + json.dumps(obj, ensure_ascii=False)
-    for e in els[1:]:
-        e.text = ""
+    replace_instruction(els, head + " " + json.dumps(obj, ensure_ascii=False))
 
 
 def _save(root, path):
@@ -319,7 +316,7 @@ def audit_output(src_docx, out_docx, item_mapping, verbose=True):
 
     比"数域个数"强得多：能发现整组漏转、显示文本被改写、DOI 集合错位、
     URI 指向了错误条目、组内条目数不对。
-    返回 {'total','matched','problems':[...]}
+    返回 total/matched/problems 对账结果，以及 structure_errors/nested_citations 域结构计数。
     """
     key_of_doi = {
         normalize_doi(v.get("doi") or v.get("csl", {}).get("DOI")): v.get("itemKey")
@@ -341,6 +338,8 @@ def audit_output(src_docx, out_docx, item_mapping, verbose=True):
 
     sroot = load_root(src_docx)
     oroot = load_root(out_docx)
+    parsed = parse_fields(oroot)
+    nested_citations = parsed.nested_count("ZOTERO_ITEM CSL_CITATION")
     problems = []
     total = 0
     # 原稿：按段落重建占位组
@@ -352,7 +351,7 @@ def audit_output(src_docx, out_docx, item_mapping, verbose=True):
     # insert 会在文首插入首选项域段落，输出与原稿的段落序号整体位移，
     # 按段落号配对会全线错位（v2 实测：每组都报"未找到对应域"）。
     pool = {}
-    for els, disp, para in zfi.collect_fields(oroot):
+    for els, disp, para in zfi.collect_fields(parsed):
         if "ZOTERO_ITEM CSL_CITATION" not in zfi.field_instr_text(els):
             continue
         pool.setdefault(disp, []).append(els)
@@ -390,9 +389,17 @@ def audit_output(src_docx, out_docx, item_mapping, verbose=True):
     matched = total - len(problems)
     if verbose:
         print(f"逐组对账: {matched}/{total} 一致, 异常 {len(problems)}")
+        if parsed.structure_errors or nested_citations:
+            print(f"域结构异常 {parsed.structure_errors}, 嵌套引文 {nested_citations}")
         for p in problems[:10]:
             print("   ", p)
-    return {"total": total, "matched": matched, "problems": problems}
+    return {
+        "total": total,
+        "matched": matched,
+        "problems": problems,
+        "structure_errors": parsed.structure_errors,
+        "nested_citations": nested_citations,
+    }
 
 
 # ---------------------------------------------------------------- CLI
@@ -430,7 +437,11 @@ def main(argv=None):
             report = audit_output(args.source, args.output, mapping, verbose=not args.json)
             if args.json:
                 print(json.dumps(report, ensure_ascii=True, indent=2))
-            return 1 if report["problems"] else 0
+            return (
+                1
+                if (report["problems"] or report["structure_errors"] or report["nested_citations"])
+                else 0
+            )
         elif args.command == "renumber":
             count = renumber_citation_ids(
                 args.document, from_docx=args.source, prefix=args.prefix, dry_run=args.dry_run

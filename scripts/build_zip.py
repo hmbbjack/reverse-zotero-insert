@@ -16,6 +16,7 @@ RELEASE_FILES = (
     "reference_ingest.py",
     "zotero_field_insert.py",
     "zotero_mcp.py",
+    "word_fields.py",
     "README.md",
     "README.en.md",
     "LICENSE",
