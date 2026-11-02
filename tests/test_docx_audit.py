@@ -128,8 +128,8 @@ class TestCollectFields(TmpMixin):
         # 手工把 5 段包进一个 BIBL 域（模拟 Zotero 写入的跨段文献表）
         from lxml import etree as ET
 
-        z = zipfile.ZipFile(src)
-        root = ET.fromstring(z.read("word/document.xml"))
+        with zipfile.ZipFile(src) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
         W = zfi.W
         paras = root.find(W + "body").findall(W + "p")[1:6]
         begin = ET.SubElement(ET.SubElement(paras[0], W + "r"), W + "fldChar")
@@ -144,7 +144,8 @@ class TestCollectFields(TmpMixin):
         with zipfile.ZipFile(src) as zin, zipfile.ZipFile(self.path("y.docx"), "w") as zo:
             for i in zin.infolist():
                 zo.writestr(i, xml if i.filename == "word/document.xml" else zin.read(i.filename))
-        root2 = ET.fromstring(zipfile.ZipFile(self.path("y.docx")).read("word/document.xml"))
+        with zipfile.ZipFile(self.path("y.docx")) as archive:
+            root2 = ET.fromstring(archive.read("word/document.xml"))
         fields = zfi.collect_fields(root2)
         self.assertEqual(len(fields), 1)
         self.assertIn("ZOTERO_BIBL", zfi.field_instr_text(fields[0][0]))
@@ -159,8 +160,8 @@ class TestCollectFields(TmpMixin):
         d.save(src)
         from lxml import etree as ET
 
-        z = zipfile.ZipFile(src)
-        root = ET.fromstring(z.read("word/document.xml"))
+        with zipfile.ZipFile(src) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
         W = zfi.W
         paras = root.find(W + "body").findall(W + "p")[1:4]
         b = ET.SubElement(ET.SubElement(paras[0], W + "r"), W + "fldChar")
@@ -175,7 +176,8 @@ class TestCollectFields(TmpMixin):
         with zipfile.ZipFile(src) as zin, zipfile.ZipFile(self.path("c.docx"), "w") as zo:
             for i in zin.infolist():
                 zo.writestr(i, xml if i.filename == "word/document.xml" else zin.read(i.filename))
-        root2 = ET.fromstring(zipfile.ZipFile(self.path("c.docx")).read("word/document.xml"))
+        with zipfile.ZipFile(self.path("c.docx")) as archive:
+            root2 = ET.fromstring(archive.read("word/document.xml"))
         res = zfi.residual_placeholders(root2)
         self.assertEqual([r["para"] for r in res], [0])  # 只剩正文那一处
 
@@ -187,8 +189,8 @@ class TestCollectFields(TmpMixin):
         d.save(src)
         from lxml import etree as ET
 
-        z = zipfile.ZipFile(src)
-        root = ET.fromstring(z.read("word/document.xml"))
+        with zipfile.ZipFile(src) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
         W = zfi.W
         p = root.find(W + "body").findall(W + "p")[0]
         first = True
@@ -211,7 +213,8 @@ class TestCollectFields(TmpMixin):
         with zipfile.ZipFile(src) as zin, zipfile.ZipFile(self.path("e.docx"), "w") as zo:
             for i in zin.infolist():
                 zo.writestr(i, xml if i.filename == "word/document.xml" else zin.read(i.filename))
-        root2 = ET.fromstring(zipfile.ZipFile(self.path("e.docx")).read("word/document.xml"))
+        with zipfile.ZipFile(self.path("e.docx")) as archive:
+            root2 = ET.fromstring(archive.read("word/document.xml"))
         obj = zfi.field_payload(zfi.collect_fields(root2)[0][0])
         self.assertEqual(obj["citationID"], "a1")
 
@@ -256,9 +259,10 @@ class TestCitationIdIsolation(TmpMixin):
         zfi.insert_zotero_fields(src, out, (0, 1), [], mapping("10.1000/a", "10.1000/b"))
         n = da.renumber_citation_ids(out, new_display_texts=["(doi:10.1000/a)"], prefix="sis")
         self.assertEqual(n, 1)
-        root = __import__("lxml.etree", fromlist=["etree"]).fromstring(
-            zipfile.ZipFile(out).read("word/document.xml")
-        )
+        with zipfile.ZipFile(out) as archive:
+            root = __import__("lxml.etree", fromlist=["etree"]).fromstring(
+                archive.read("word/document.xml")
+            )
         ids = zfi.citation_id_stats(root)["ids"]
         self.assertIn("sis0", ids)
         self.assertIn("cit1", ids)
@@ -313,7 +317,8 @@ class TestTableAudit(TmpMixin):
         d.save(src)
         from lxml import etree as ET
 
-        root = ET.fromstring(zipfile.ZipFile(src).read("word/document.xml"))
+        with zipfile.ZipFile(src) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
         rep = da.table_column_audit(root)
         col1 = [c for c in rep[0]["columns"] if c["index"] == 1][0]
         col2 = [c for c in rep[0]["columns"] if c["index"] == 2][0]
@@ -348,7 +353,8 @@ class TestRepair(TmpMixin):
         self.assertEqual(n, 1)
         from lxml import etree as ET
 
-        root = ET.fromstring(zipfile.ZipFile(out).read("word/document.xml"))
+        with zipfile.ZipFile(out) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
         self.assertNotIn("DEADKEY1", zfi.document_item_keys(root))
 
     def test_dead_key_survives_verify_and_is_reported(self):
@@ -461,8 +467,8 @@ class TestScanDocument(TmpMixin):
         # 人为制造撞号：两个不同引文共用同一 citationID
         from lxml import etree as ET
 
-        z = zipfile.ZipFile(out)
-        root = ET.fromstring(z.read("word/document.xml"))
+        with zipfile.ZipFile(out) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
         for els, _, _ in zfi.collect_fields(root):
             full = zfi.field_instr_text(els)
             if "CSL_CITATION" in full:

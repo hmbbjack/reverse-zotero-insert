@@ -1169,8 +1169,8 @@ class TestVerifyAllowsAbstract(unittest.TestCase):
             import zipfile
             from lxml import etree as ET
 
-            z = zipfile.ZipFile(out)
-            root = ET.fromstring(z.read("word/document.xml"))
+            with zipfile.ZipFile(out) as archive:
+                root = ET.fromstring(archive.read("word/document.xml"))
             for it in root.iter(zfi.W + "instrText"):
                 if "CSL_CITATION" in (it.text or ""):
                     obj = json.loads(it.text.split("CSL_CITATION", 1)[1].strip())
